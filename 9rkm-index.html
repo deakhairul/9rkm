@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>9Router Key Manager</title>
+<style>
+  :root{--bg:#0f1115;--card:#171a21;--line:#262b36;--txt:#e6e9ef;--dim:#8b93a3;--ok:#3ddc84;--bad:#ff5c5c;--acc:#4da3ff}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--txt);font-family:system-ui,Segoe UI,Arial,sans-serif;min-height:100vh}
+  .wrap{max-width:860px;margin:0 auto;padding:24px 16px 60px}
+  h1{font-size:20px;margin-bottom:4px}
+  .sub{color:var(--dim);font-size:12px;margin-bottom:20px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px}
+  .row{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+  .badge{padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700}
+  .badge.on{background:#123525;color:var(--ok)}
+  .badge.off{background:#3a1414;color:var(--bad)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:14px}
+  .stat{background:#12151d;border:1px solid var(--line);border-radius:10px;padding:12px}
+  .stat .v{font-size:24px;font-weight:700}
+  .stat .l{color:var(--dim);font-size:11px;margin-top:2px}
+  .btn{display:inline-block;border:none;border-radius:10px;padding:12px 18px;font-size:14px;font-weight:700;cursor:pointer}
+  .btn.on{background:#123525;color:var(--ok);border:1px solid var(--ok)}
+  .btn.off{background:#3a1414;color:var(--bad);border:1px solid var(--bad)}
+  .btn:disabled{opacity:.5;cursor:wait}
+  .log{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:var(--dim);margin-top:10px;white-space:pre-wrap;word-break:break-word}
+  .err{color:var(--bad);font-size:13px;margin-top:8px}
+  table{width:100%;border-collapse:collapse;font-size:13px;margin-top:10px}
+  th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
+  th{color:var(--dim);font-weight:600;font-size:11px;text-transform:uppercase}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>9Router Key Manager</h1>
+  <div class="sub" id="ts">—</div>
+
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <div style="font-size:14px;font-weight:700">Key Manager</div>
+        <div class="log" id="toggleinfo">-</div>
+      </div>
+      <span class="badge off" id="badge">…</span>
+    </div>
+    <div class="row" style="margin-top:14px">
+      <button class="btn on" id="bOn" disabled>✅ KEY MANAGER ON</button>
+      <button class="btn off" id="bOff" disabled>⛔ KEY MANAGER OFF</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="font-size:14px;font-weight:700">Key 9Router</div>
+    <div class="grid">
+      <div class="stat"><div class="v" id="sActive">-</div><div class="l">AKTIF / TOTAL</div></div>
+      <div class="stat"><div class="v" id="sRetired">-</div><div class="l">PENSIUN (tetap OFF)</div></div>
+      <div class="stat"><div class="v" id="sProv">-</div><div class="l">PROVIDER</div></div>
+    </div>
+    <table id="tbl"><tr><th>Provider</th><th>Aktif</th></tr></table>
+    <div class="log" id="log"></div>
+  </div>
+
+  <div class="card" id="retiredCard" style="display:none">
+    <div style="font-size:14px;font-weight:700">Key pensiun (≥50 siklus gagal)</div>
+    <table id="tblRetired"><tr><th>Provider</th><th>Nama</th><th>Siklus</th></tr></table>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let snap = null;
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, opts);
+  if (r.status === 401) throw new Error('Tidak diizinkan');
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+
+function render(s) {
+  snap = s;
+  $('ts').textContent = 'Update: ' + s.ts;
+  const on = s.enabled;
+  const b = $('badge');
+  b.textContent = on ? 'KEY MANAGER AKTIF' : 'KEY MANAGER OFF';
+  b.className = 'badge ' + (on ? 'on' : 'off');
+  const t = s.toggle || {};
+  $('toggleinfo').textContent = (t.by ? 'by ' + t.by + ' @ ' + (t.at || '') : 'default ON');
+  $('bOn').disabled = on;
+  $('bOff').disabled = !on;
+  $('sActive').textContent = s.active + ' / ' + s.total;
+  $('sRetired').textContent = s.retired_count;
+  $('sProv').textContent = s.by_provider.length;
+  const tb = $('tbl');
+  while (tb.rows.length > 1) tb.deleteRow(1);
+  (s.by_provider || []).forEach(p => {
+    const tr = tb.insertRow();
+    tr.insertCell().textContent = p.provider;
+    tr.insertCell().textContent = p.count;
+  });
+  const rc = $('retiredCard');
+  if (s.retired_count > 0) {
+    rc.style.display = '';
+    const trb = $('tblRetired');
+    while (trb.rows.length > 1) trb.deleteRow(1);
+    (s.retired || []).forEach(r => {
+      const tr = trb.insertRow();
+      tr.insertCell().textContent = r.provider;
+      tr.insertCell().textContent = r.name || '-';
+      tr.insertCell().textContent = r.failed_cycles;
+    });
+  } else rc.style.display = 'none';
+  $('log').textContent = '';
+}
+
+async function refresh() {
+  try {
+    render(await api('/api/status'));
+  } catch (e) {
+    $('log').textContent = 'Error: ' + e.message;
+  }
+}
+
+async function toggle(enabled) {
+  $('bOn').disabled = $('bOff').disabled = true;
+  try {
+    const s = await api('/api/toggle', {method: 'POST', body: JSON.stringify({enabled})});
+    render(s);
+    $('log').textContent = 'Toggle berhasil: ' + (enabled ? 'ON' : 'OFF') + ' @ ' + s.ts;
+  } catch (e) {
+    $('log').textContent = 'Gagal: ' + e.message;
+  }
+}
+
+$('bOn').onclick = () => toggle(true);
+$('bOff').onclick = () => toggle(false);
+refresh();
+setInterval(refresh, 15000);
+</script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+.env
+.env.*
+*.pem
+*.key
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+jwt-secret
+auth/
+*.log
+data.sqlite

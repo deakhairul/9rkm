@@ -1,0 +1,16 @@
+[Unit]
+Description=9Router Key Manager (9RKM) — auto-off + reset + TG/Web control
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/scripts
+ExecStart=/usr/bin/python3 /home/ubuntu/scripts/key_manager.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/ubuntu/scripts/key_manager.log
+StandardError=append:/home/ubuntu/scripts/key_manager.log
+
+[Install]
+WantedBy=multi-user.target

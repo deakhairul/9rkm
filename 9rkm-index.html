@@ -29,6 +29,13 @@
   table{width:100%;border-collapse:collapse;font-size:13px;margin-top:10px}
   th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
   th{color:var(--dim);font-weight:600;font-size:11px;text-transform:uppercase}
+  .bulk-row{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap}
+  .btn.bulk{flex:1;min-width:160px}
+  .btn.activate{background:#123525;color:var(--ok);border:1px solid var(--ok)}
+  .btn.deactivate{background:#3a1414;color:var(--bad);border:2px dashed var(--bad)}
+  dialog{border:1px solid var(--line);background:var(--card);color:var(--txt);border-radius:12px;padding:16px;max-width:420px;margin:auto}
+  dialog::backdrop{background:rgba(0,0,0,.6)}
+  dialog input{width:100%;margin:8px 0;padding:8px;border-radius:8px;border:1px solid var(--line);background:#12151d;color:var(--txt)}
 </style>
 </head>
 <body>
@@ -58,10 +65,17 @@
       <div class="stat"><div class="v" id="sRetired">-</div><div class="l">PENSIUN (tetap OFF)</div></div>
       <div class="stat"><div class="v" id="sProv">-</div><div class="l">PROVIDER</div></div>
     </div>
+    <div class="bulk-row">
+      <button class="btn bulk activate" id="bBulkOn">⚡ ACTIVATE ALL KEY</button>
+      <button class="btn bulk deactivate" id="bBulkOff">⛔ DEACTIVATE ALL KEY</button>
+    </div>
+    <div class="log" id="bulklog"></div>
     <table id="tbl"><tr><th>Provider</th><th>Aktif</th></tr></table>
     <div class="log" id="log"></div>
   </div>
 
+  <dialog id="dlgOff"><form method="dialog"><div style="font-weight:700;color:var(--bad)">DEACTIVATE ALL KEY?</div><div class="log" style="margin:6px 0">Semua key akan OFF sampai ACTIVATE manual (tahan cycle 5j). Ketik <b>OFF</b> untuk konfirmasi.</div><input id="dlgOffInput" placeholder="OFF" autocomplete="off"><div class="row" style="margin-top:10px"><button value="cancel" class="btn" style="flex:1">Batal</button><button id="dlgOffOk" value="ok" class="btn off" style="flex:1">DEACTIVATE</button></div></form></dialog>
+  <dialog id="dlgOn"><form method="dialog"><div style="font-weight:700;color:var(--ok)">ACTIVATE ALL KEY?</div><div class="log" style="margin:6px 0">Semua key termasuk pensiun (≥50 siklus) akan diaktifkan &amp; dibersihkan error.</div><div class="row" style="margin-top:10px"><button value="cancel" class="btn" style="flex:1">Batal</button><button value="ok" class="btn on" style="flex:1">ACTIVATE</button></div></form></dialog>
   <div class="card" id="retiredCard" style="display:none">
     <div style="font-size:14px;font-weight:700">Key pensiun (≥50 siklus gagal)</div>
     <table id="tblRetired"><tr><th>Provider</th><th>Nama</th><th>Siklus</th></tr></table>
@@ -134,8 +148,26 @@ async function toggle(enabled) {
   }
 }
 
+function showBulk(s){const b=s.bulk_last;if(!b){$('bulklog').textContent='';return}$('bulklog').textContent='Bulk terakhir: '+b.action+' '+b.n+' key by '+b.by+' @ '+(b.at||'')}
+function renderBulk(s){showBulk(s)}
+
+const _renderOrig = render;
+render = function(s){_renderOrig(s);renderBulk(s)}
+
+async function bulk(action){
+  const path = action==='on' ? '/api/keys/activate_all' : '/api/keys/deactivate_all';
+  $('bBulkOn').disabled=$('bBulkOff').disabled=true;
+  try{const s=await api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});render(s);$('bulklog').textContent='Bulk '+(action==='on'?'ACTIVATE':'DEACTIVATE')+' OK: '+s.bulk_result.n+' key @ '+s.ts}
+  catch(e){$('bulklog').textContent='Gagal bulk: '+e.message}
+  finally{$('bBulkOn').disabled=$('bBulkOff').disabled=false}
+}
 $('bOn').onclick = () => toggle(true);
 $('bOff').onclick = () => toggle(false);
+$('bBulkOn').onclick = () => $('dlgOn').showModal();
+$('bBulkOff').onclick = () => {$('dlgOffInput').value='';$('dlgOff').showModal();};
+$('dlgOn').addEventListener('close',()=>{if($('dlgOn').returnValue==='ok')bulk('on')});
+$('dlgOff').addEventListener('close',()=>{if($('dlgOff').returnValue==='ok' && $('dlgOffInput').value.trim()==='OFF')bulk('off');else if($('dlgOff').returnValue==='ok')$('bulklog').textContent='Batal: ketik OFF tidak cocok';});
+$('dlgOffInput').addEventListener('input',()=>{$('dlgOffOk').disabled=$('dlgOffInput').value.trim()!=='OFF'});
 refresh();
 setInterval(refresh, 15000);
 </script>

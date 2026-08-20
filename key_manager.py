@@ -326,12 +326,78 @@ def run_scan_tick():
 
 # ---------- Cycle 5 jam (reset ON + retire) ----------
 
+BULK_SCOPE = "rkm_bulk"
+BULK_KEY = "last"
+
+def bulk_activate_all(by="WebUI"):
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM providerConnections;")
+        ids = [r["id"] for r in cur.fetchall()]
+        now = get_iso_now()
+        if ids:
+            ph = ",".join("?" for _ in ids)
+            cur.execute(f"UPDATE providerConnections SET data = json_remove(data, '$.errorCode', '$.lastError', '$.lastErrorAt', '$.backoffLevel'), updatedAt = ? WHERE id IN ({ph}) AND json_valid(data);", [now] + ids)
+            cur.execute(f"UPDATE providerConnections SET isActive = 1, updatedAt = ? WHERE id IN ({ph});", [now] + ids)
+        state = load_state_from_db(cur)
+        for cid in ids:
+            st = state.get(cid, {})
+            st["failed_cycles"] = 0
+            st["is_retired"] = False
+            st.pop("consecutive_off_days", None)
+            st.pop("off_cycle_id", None)
+            st.pop("counted_cycle_id", None)
+            st.pop("manual_off", None)
+            st.pop("manual_off_at", None)
+            st.pop("auto_off_ts", None)
+            state[cid] = st
+        bulk = {"action": "activate_all", "by": by, "at": now, "n": len(ids)}
+        save_state_to_db(cur, bulk, BULK_SCOPE, BULK_KEY)
+        save_state_to_db(cur, state)
+        conn.commit()
+        log(f"[Bulk] ACTIVATE ALL {len(ids)} by {by}.")
+        notify(f"\u26a1 <b>9RKM Bulk ACTIVATE ALL</b> — <b>{len(ids)}</b> key diaktifkan (termasuk pensiun) by {html.escape(by)} @ {now}")
+        return len(ids), bulk
+    finally:
+        conn.close()
+
+def bulk_deactivate_all(by="WebUI"):
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM providerConnections;")
+        ids = [r["id"] for r in cur.fetchall()]
+        now = get_iso_now()
+        if ids:
+            ph = ",".join("?" for _ in ids)
+            cur.execute(f"UPDATE providerConnections SET isActive = 0, updatedAt = ? WHERE id IN ({ph});", [now] + ids)
+        state = load_state_from_db(cur)
+        for cid in ids:
+            st = state.get(cid, {"failed_cycles": 0, "is_retired": False})
+            st["manual_off"] = True
+            st["manual_off_at"] = now
+            st["manual_off_by"] = by
+            state[cid] = st
+        bulk = {"action": "deactivate_all", "by": by, "at": now, "n": len(ids)}
+        save_state_to_db(cur, bulk, BULK_SCOPE, BULK_KEY)
+        save_state_to_db(cur, state)
+        conn.commit()
+        log(f"[Bulk] DEACTIVATE ALL {len(ids)} by {by}.")
+        notify(f"\u26d4 <b>9RKM Bulk DEACTIVATE ALL</b> — <b>{len(ids)}</b> key dimatikan (tahan sampai ACTIVATE manual) by {html.escape(by)} @ {now}")
+        return len(ids), bulk
+    finally:
+        conn.close()
+
 def reconcile_state_and_connections(conns, state):
     to_activate = []
     retired = []
     for c in conns:
         cid = c["id"]
         cstate = state.get(cid)
+        if cstate and cstate.get("manual_off"):
+            retired.append({**c, "failed_cycles": cstate.get("failed_cycles", 0)})
+            continue
         if cstate:
             is_ret = cstate.get("is_retired", False)
             failed_cycles = cstate.get("failed_cycles", cstate.get("consecutive_off_days", 0))
@@ -457,6 +523,7 @@ def status_snapshot():
             if item.get("is_retired"):
                 label, fallback_name = connection_labels.get(cid, (item.get("provider", "unknown"), item.get("name", "-")))
                 retired.append({"provider": label, "name": item.get("name") or fallback_name, "failed_cycles": item.get("failed_cycles", 0)})
+        bulk_last = load_state_from_db(cur, BULK_SCOPE, BULK_KEY)
         return {
             "enabled": enabled,
             "toggle": togg,
@@ -465,6 +532,7 @@ def status_snapshot():
             "by_provider": by_prov,
             "retired_count": len(retired),
             "retired": retired,
+            "bulk_last": bulk_last if bulk_last else None,
             "ts": datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7))).strftime("%Y-%m-%d %H:%M:%S WIB"),
         }
     finally:
@@ -508,6 +576,14 @@ class RkmHandler(http.server.BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def do_POST(self):
+        if self.path.startswith("/api/keys/activate_all"):
+            n, bulk = bulk_activate_all("WebUI")
+            self._json(200, {**status_snapshot(), "bulk_result": {"n": n, **bulk}})
+            return
+        if self.path.startswith("/api/keys/deactivate_all"):
+            n, bulk = bulk_deactivate_all("WebUI")
+            self._json(200, {**status_snapshot(), "bulk_result": {"n": n, **bulk}})
+            return
         if self.path.startswith("/api/toggle"):
             try:
                 ln = int(self.headers.get("Content-Length", 0))

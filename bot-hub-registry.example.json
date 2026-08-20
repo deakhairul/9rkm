@@ -1,0 +1,20 @@
+{
+  "projects": [
+    {
+      "id": "9rkm",
+      "bot": "YourKeyManagerBot",
+      "patterns": ["/start", "/status", "/keymanager", "rkm:"],
+      "target": "http://127.0.0.1:8819/api/tg",
+      "token_file": "/home/ubuntu/scripts/daily-key-check.env",
+      "token_var": "BOT_TOKEN"
+    },
+    {
+      "id": "example-project",
+      "bot": "YourOtherBot",
+      "patterns": ["*"],
+      "target": "http://127.0.0.1:8820/api/tg",
+      "token_file": "/home/ubuntu/your-project/.env",
+      "token_var": "TELEGRAM_BOT_TOKEN"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+[Unit]
+Description=Bot Hub — poller tunggal semua bot Telegram (Control Surface Fase B)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+ExecStart=/usr/bin/python3 /home/ubuntu/scripts/bot_hub.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

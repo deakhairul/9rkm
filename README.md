@@ -1,6 +1,6 @@
-# 9Router Supporting Suite
+# 9RKM — 9Router Key Manager & Ops Suite
 
-Supporting tooling for a self-hosted [9Router](https://www.npmjs.com/package/decolua/9router) LLM gateway deployment: an API-key lifecycle manager (9RKM), quality monitors, and watchdogs. Pure Python stdlib + one single-file HTML dashboard. No secrets ever live in this repo.
+Supporting tooling for a self-hosted [9Router](https://www.npmjs.com/package/decolua/9router) LLM gateway deployment: an API-key lifecycle manager (9RKM), a multi-bot Telegram hub, quality monitors, and watchdogs. Pure Python stdlib + one single-file HTML dashboard. No secrets ever live in this repo.
 
 > The 9Router engine itself is the upstream npm package — this repo only contains custom supporting code around it.
 
@@ -11,6 +11,9 @@ Supporting tooling for a self-hosted [9Router](https://www.npmjs.com/package/dec
 | `key_manager.py` | **9RKM** — key-manager daemon: 5s error scan → auto-OFF, 5-hour reset cycle, retire logic, Web UI + Telegram control |
 | `9rkm-index.html` | 9RKM Web UI (dark theme, single file, no build step) |
 | `9rkm.service` | systemd unit for the daemon |
+| `bot_hub.py` | **Bot Hub** — single poller for multiple Telegram bots, HTTP-dispatches updates to each project (avoids Telegram 409 conflicts) |
+| `bot-hub-registry.example.json` | Registry template: bot → patterns → HTTP target |
+| `bot-hub.service` | systemd unit for the hub |
 | `tg_notify.py` | Shared Telegram notifier (credentials from external env file) |
 | `gateway-quality-monitor.py` | Error-rate sensor + tool-calling canary (anti silent-degradation) |
 | `health-models.py` | Daily health check for every model in a combo; 3 consecutive failures → alert |
@@ -40,6 +43,21 @@ Supporting tooling for a self-hosted [9Router](https://www.npmjs.com/package/dec
 
 ![9RKM Web UI](docs/9rkm-webui.png)
 
+## Bot Hub — one poller, many bots
+
+Telegram allows only **one `getUpdates` poller per bot token** (a second poller gets `409 Conflict`). The hub solves this for multi-project VPS setups:
+
+```
+ bot A token ─┐                        ┌─► POST /api/tg → project 1 (replies itself)
+ bot B token ─┼─► bot_hub.py (pollers) ─┤
+ bot N token ─┘   pattern routing       └─► POST /api/tg → project 2 (replies itself)
+```
+
+- One long-poll thread per token; offset bookkeeping owned by the hub.
+- Routing is pure substring/pattern match from `bot-hub-registry.json` (`"*"` = catch-all).
+- Projects receive the raw update JSON and reply with their own token — no shared state.
+- `--dry` (log only, no forward) and `--bots id1,id2` (subset) flags for testing.
+
 ## Quickstart
 
 ```bash
@@ -55,6 +73,9 @@ python3 key_manager.py
 
 # 3. (optional) install as a service
 sudo cp 9rkm.service /etc/systemd/system/ && sudo systemctl enable --now 9rkm
+
+# 4. (optional) bot hub — copy the registry example, edit targets, then:
+sudo cp bot-hub.service /etc/systemd/system/ && sudo systemctl enable --now bot-hub
 ```
 
 ## Configuration

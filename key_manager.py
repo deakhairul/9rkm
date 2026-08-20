@@ -25,6 +25,18 @@ MAX_FAILED_CYCLES = 50
 CYCLE_HOURS = 5
 CYCLE_SECONDS = CYCLE_HOURS * 3600
 SLEEP_INTERVAL = 5
+EC_HINT = {400: "Request salah", 401: "Kunci salah/expired, ganti key", 402: "Perlu bayar, saldo habis", 403: "Akses ditolak (blokir/belum bayar)", 429: "Kuota habis, tunggu isi ulang"}
+
+def _hint(ec):
+    try:
+        c = int(str(ec).strip())
+    except Exception:
+        return f"Error gateway kode {ec}"
+    if c in EC_HINT:
+        return EC_HINT[c]
+    if 500 <= c <= 599:
+        return "Gangguan server gateway"
+    return f"Error gateway kode {c}"
 
 def log(msg):
     ts = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7))).strftime("%Y-%m-%d %H:%M:%S WIB")
@@ -135,7 +147,8 @@ def candidates_from_error_code(active_map, requests_by_conn):
             "connectionId": cid,
             "consecutive_errors": 1,
             "total_in_window": len(reqs),
-            "last_reason": f"errorCode {ec} (state gateway)",
+            "ec": ec,
+            "last_reason": _hint(ec),
             "_source": "errorCode",
         })
     return found
@@ -227,8 +240,11 @@ def run_scan_tick():
             conn_state.pop("consecutive_off_days", None)
             conn_state["last_off_date"] = today_wib
             state[cid] = conn_state
-            src_label = "errorCode" if c.get("_source") == "errorCode" else f"{c['consecutive_errors']}x err"
-            off_list_msg.append(f"• <b>{html.escape(prov)}</b> ({html.escape(name[:20])}) — {src_label} ({html.escape(c['last_reason'])}) [Siklus ke-{conn_state.get('failed_cycles', 1)}]")
+            ec = html.escape(str(c.get("ec", "")))
+            hint = html.escape(c.get("last_reason", ""))
+            acct = html.escape((info.get("email") or name[:20] or "-"))
+            siklus = conn_state.get('failed_cycles', 1)
+            off_list_msg.append(f"• <b>{html.escape(prov)}</b> | {acct} | {ec} | {hint} | S{siklus}")
 
         save_state_to_db(cursor, state)
         conn.commit()

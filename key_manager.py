@@ -8,10 +8,12 @@ Satu daemon menggantikan key-disable-daemon.py + daily-key-check.py + hourly-key
 Toggle di scope KV 'key_auto_off_toggle' - terpisah dari state 'hourly_key_disable'.
 """
 import sys, os, time, json, sqlite3, html, datetime, threading
+import urllib.request, urllib.error, urllib.parse
 import http.server, socketserver
 from tg_notify import notify
 
 DB = os.environ.get("ROUTER_DB", "/home/ubuntu/.9router/db/data.sqlite")
+ENV = os.environ.get("ROUTER_ENV", "/home/ubuntu/scripts/daily-key-check.env")
 UI_PATH = os.environ.get("RKM_UI_PATH", "/home/ubuntu/scripts/9rkm")
 HTTP_HOST = os.environ.get("RKM_HTTP_HOST", "127.0.0.1")
 HTTP_PORT = int(os.environ.get("RKM_HTTP_PORT", "8819"))
@@ -45,6 +47,17 @@ def get_cycle_id(now=None):
 def get_cutoff_iso(hours=1):
     dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+def load_env():
+    vals = {}
+    if os.path.exists(ENV):
+        with open(ENV, encoding="utf-8") as f:
+            for line in f:
+                if "=" in line and not line.strip().startswith("#"):
+                    k, _, v = line.strip().partition("=")
+                    vals[k.strip()] = v.strip()
+    return vals
+
 
 def provider_label(provider, data=None):
     specific = data.get("providerSpecificData") if isinstance(data, dict) else None
@@ -98,56 +111,7 @@ def set_toggle(enabled, by):
 
 # ---------- Scan 5s (auto-OFF) ----------
 
-def get_response_error(data_str):
-    if not data_str:
-        return None, ""
-    try:
-        response = json.loads(data_str).get("response", {})
-        if not isinstance(response, dict):
-            return None, ""
-        code = response.get("status")
-        reason = response.get("error") or response.get("message") or ""
-        if isinstance(reason, dict):
-            code = code or reason.get("code")
-            reason = reason.get("message") or reason.get("status") or json.dumps(reason)
-        elif isinstance(reason, str):
-            try:
-                nested = json.loads(reason)
-                error = nested.get("error", {}) if isinstance(nested, dict) else {}
-                if isinstance(error, dict):
-                    code = code or error.get("code")
-                    reason = error.get("message") or error.get("status") or reason
-            except Exception:
-                pass
-        try:
-            code = int(code)
-        except Exception:
-            code = None
-        return code, " ".join(str(reason).split())[:120]
-    except Exception:
-        return None, ""
 
-def evaluate_consecutive_errors(requests_by_conn):
-    candidates = []
-    for conn_id, reqs in requests_by_conn.items():
-        if not reqs:
-            continue
-        consecutive_err = 0
-        last_reason = ""
-        for ts, status, data_str in reversed(reqs):
-            if str(status).strip().lower() != "error":
-                break
-            consecutive_err += 1
-            if not last_reason:
-                _, last_reason = get_response_error(data_str)
-        if consecutive_err >= 3:
-            candidates.append({
-                "connectionId": conn_id,
-                "consecutive_errors": consecutive_err,
-                "total_in_window": len(reqs),
-                "last_reason": last_reason or "Error beruntun",
-            })
-    return candidates
 
 def candidates_from_error_code(active_map, requests_by_conn):
     found = []
@@ -231,13 +195,7 @@ def run_scan_tick():
                     state[cid].pop("counted_cycle_id", None)
                     state[cid]["is_retired"] = False
 
-        candidates = evaluate_consecutive_errors(requests_by_conn)
-        ec_candidates = candidates_from_error_code(active_map, requests_by_conn)
-        seen = {c["connectionId"] for c in candidates}
-        for c in ec_candidates:
-            if c["connectionId"] not in seen:
-                candidates.append(c)
-                seen.add(c["connectionId"])
+        candidates = candidates_from_error_code(active_map, requests_by_conn)
 
         if not candidates:
             save_state_to_db(cursor, state)
@@ -298,78 +256,12 @@ def run_scan_tick():
 
 # ---------- Cycle 5 jam (reset ON + retire) ----------
 
-BULK_SCOPE = "rkm_bulk"
-BULK_KEY = "last"
-
-def bulk_activate_all(by="WebUI"):
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT id FROM providerConnections;")
-        ids = [r["id"] for r in cur.fetchall()]
-        now = get_iso_now()
-        if ids:
-            ph = ",".join("?" for _ in ids)
-            cur.execute(f"UPDATE providerConnections SET data = json_remove(data, '$.errorCode', '$.lastError', '$.lastErrorAt', '$.backoffLevel'), updatedAt = ? WHERE id IN ({ph}) AND json_valid(data);", [now] + ids)
-            cur.execute(f"UPDATE providerConnections SET isActive = 1, updatedAt = ? WHERE id IN ({ph});", [now] + ids)
-        state = load_state_from_db(cur)
-        for cid in ids:
-            st = state.get(cid, {})
-            st["failed_cycles"] = 0
-            st["is_retired"] = False
-            st.pop("consecutive_off_days", None)
-            st.pop("off_cycle_id", None)
-            st.pop("counted_cycle_id", None)
-            st.pop("manual_off", None)
-            st.pop("manual_off_at", None)
-            st.pop("auto_off_ts", None)
-            state[cid] = st
-        bulk = {"action": "activate_all", "by": by, "at": now, "n": len(ids)}
-        save_state_to_db(cur, bulk, BULK_SCOPE, BULK_KEY)
-        save_state_to_db(cur, state)
-        conn.commit()
-        log(f"[Bulk] ACTIVATE ALL {len(ids)} by {by}.")
-        notify(f"\u26a1 <b>9RKM Bulk ACTIVATE ALL</b> — <b>{len(ids)}</b> key diaktifkan (termasuk pensiun) by {html.escape(by)} @ {now}")
-        return len(ids), bulk
-    finally:
-        conn.close()
-
-def bulk_deactivate_all(by="WebUI"):
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT id FROM providerConnections;")
-        ids = [r["id"] for r in cur.fetchall()]
-        now = get_iso_now()
-        if ids:
-            ph = ",".join("?" for _ in ids)
-            cur.execute(f"UPDATE providerConnections SET isActive = 0, updatedAt = ? WHERE id IN ({ph});", [now] + ids)
-        state = load_state_from_db(cur)
-        for cid in ids:
-            st = state.get(cid, {"failed_cycles": 0, "is_retired": False})
-            st["manual_off"] = True
-            st["manual_off_at"] = now
-            st["manual_off_by"] = by
-            state[cid] = st
-        bulk = {"action": "deactivate_all", "by": by, "at": now, "n": len(ids)}
-        save_state_to_db(cur, bulk, BULK_SCOPE, BULK_KEY)
-        save_state_to_db(cur, state)
-        conn.commit()
-        log(f"[Bulk] DEACTIVATE ALL {len(ids)} by {by}.")
-        notify(f"\u26d4 <b>9RKM Bulk DEACTIVATE ALL</b> — <b>{len(ids)}</b> key dimatikan (tahan sampai ACTIVATE manual) by {html.escape(by)} @ {now}")
-        return len(ids), bulk
-    finally:
-        conn.close()
-
 def reconcile_state_and_connections(conns, state):
     to_activate = []
     retired = []
     for c in conns:
         cid = c["id"]
         cstate = state.get(cid)
-        if cstate and cstate.get("manual_off"):
-            retired.append({**c, "failed_cycles": cstate.get("failed_cycles", 0)})
-            continue
         if cstate:
             is_ret = cstate.get("is_retired", False)
             failed_cycles = cstate.get("failed_cycles", cstate.get("consecutive_off_days", 0))
@@ -495,7 +387,6 @@ def status_snapshot():
             if item.get("is_retired"):
                 label, fallback_name = connection_labels.get(cid, (item.get("provider", "unknown"), item.get("name", "-")))
                 retired.append({"provider": label, "name": item.get("name") or fallback_name, "failed_cycles": item.get("failed_cycles", 0)})
-        bulk_last = load_state_from_db(cur, BULK_SCOPE, BULK_KEY)
         return {
             "enabled": enabled,
             "toggle": togg,
@@ -504,16 +395,108 @@ def status_snapshot():
             "by_provider": by_prov,
             "retired_count": len(retired),
             "retired": retired,
-            "bulk_last": bulk_last if bulk_last else None,
             "ts": datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7))).strftime("%Y-%m-%d %H:%M:%S WIB"),
         }
     finally:
         conn.close()
 
 # ---------- Telegram ----------
-# Input TG (polling) DIHAPUS 2026-08-18: kontrak 1 poller/bot dipegang idx_report_bot
-# (409 conflict). Notifikasi keluar tetap via notify() (sendMessage = push, bukan poll).
-# Bot-hub (Fase B) akan menjadi poller tunggal semua project.
+# Input TG (polling) DIHAPUS 2026-08-18: kontrak 1 poller/bot.
+# FASE B (2026-08-20): input via bot-hub — update di-POST ke /api/tg.
+# Notifikasi keluar tetap via notify() (sendMessage = push, bukan poll).
+
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID") or os.environ.get("CHAT_ID") or load_env().get("CHAT_ID") or ""
+TG_KEYBOARD = {"inline_keyboard": [
+    [{"text": "📊 STATUS", "callback_data": "rkm:status"}],
+    [{"text": "✅ KEY MANAGER ON", "callback_data": "rkm:on"}],
+    [{"text": "⛔ KEY MANAGER OFF", "callback_data": "rkm:off"}],
+]}
+
+
+def tg_api(method, payload):
+    env = load_env()
+    bot = env.get("BOT_TOKEN")
+    if not bot:
+        return None
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{bot}/{method}",
+        data=urllib.parse.urlencode(payload).encode(),
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read().decode())
+
+
+def tg_send(text, keyboard=False):
+    payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
+    if keyboard:
+        payload["reply_markup"] = json.dumps(TG_KEYBOARD)
+    try:
+        if tg_api("sendMessage", payload):
+            return
+    except Exception:
+        pass
+    payload.pop("parse_mode", None)
+    try:
+        tg_api("sendMessage", payload)
+    except Exception as e:
+        log(f"[-] tg_send fail: {e}")
+
+
+def tg_status_text():
+    s = status_snapshot()
+    provs = ", ".join(f"{p['provider']}={p['count']}" for p in s["by_provider"][:6])
+    toggle = "🟢 ON" if s["enabled"] else "🔴 OFF"
+    return (
+        "⚙️ <b>9RKM — Key Manager</b>\n\n"
+        f"Toggle: {toggle}\n"
+        f"Key aktif: <b>{s['active']}/{s['total']}</b>\n"
+        f"Provider: {provs or '-'}\n"
+        f"Retired: {s['retired_count']}\n\n"
+        f"Threshold auto-retire: ≥{MAX_FAILED_CYCLES} siklus ({CYCLE_HOURS} jam/siklus)\n"
+        f"⏱ {s['ts']}"
+    )
+
+
+def tg_handle(update):
+    """Update TG dari bot-hub (POST /api/tg). Whitelist chat Dea."""
+    cb = update.get("callback_query")
+    if cb:
+        if str(cb.get("from", {}).get("id")) != TG_CHAT_ID:
+            return
+        data = (cb.get("data") or "").strip()
+        if data == "rkm:on":
+            set_toggle(True, "TG")
+            tg_send("✅ Key Manager <b>ON</b> — scan 5s + reset 5 jam aktif.", keyboard=True)
+        elif data == "rkm:off":
+            set_toggle(False, "TG")
+            tg_send("⛔ Key Manager <b>OFF</b> — scan + reset berhenti.", keyboard=True)
+        elif data == "rkm:status":
+            tg_send(tg_status_text(), keyboard=True)
+        else:
+            log(f"[TG] callback tak dikenal: {data!r}")
+        try:
+            tg_api("answerCallbackQuery", {"callback_query_id": cb.get("id", "")})
+        except Exception:
+            pass
+        return
+    msg = update.get("message") or {}
+    if str(msg.get("chat", {}).get("id")) != TG_CHAT_ID:
+        return
+    low = (msg.get("text") or "").strip().lower()
+    if low in ("/start", "/status"):
+        tg_send(tg_status_text(), keyboard=True)
+    elif low.startswith("/keymanager"):
+        arg = low.replace("/keymanager", "").strip()
+        if arg == "on":
+            set_toggle(True, "TG")
+            tg_send("✅ Key Manager <b>ON</b> — scan 5s + reset 5 jam aktif.", keyboard=True)
+        elif arg == "off":
+            set_toggle(False, "TG")
+            tg_send("⛔ Key Manager <b>OFF</b> — scan + reset berhenti.", keyboard=True)
+        else:
+            tg_send(tg_status_text(), keyboard=True)
+    else:
+        tg_send("Perintah: /status · /keymanager on|off", keyboard=True)
 
 # ---------- HTTP (Web UI parity) ----------
 
@@ -548,13 +531,14 @@ class RkmHandler(http.server.BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path.startswith("/api/keys/activate_all"):
-            n, bulk = bulk_activate_all("WebUI")
-            self._json(200, {**status_snapshot(), "bulk_result": {"n": n, **bulk}})
-            return
-        if self.path.startswith("/api/keys/deactivate_all"):
-            n, bulk = bulk_deactivate_all("WebUI")
-            self._json(200, {**status_snapshot(), "bulk_result": {"n": n, **bulk}})
+        if self.path.startswith("/api/tg"):
+            try:
+                ln = int(self.headers.get("Content-Length", 0))
+                update = json.loads(self.rfile.read(ln).decode()) if ln else {}
+                tg_handle(update)
+            except Exception as e:
+                log(f"[-] /api/tg error: {e}")
+            self._json(200, {"ok": True})
             return
         if self.path.startswith("/api/toggle"):
             try:

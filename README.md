@@ -1,22 +1,83 @@
-# 9ROUTER — Supporting suite (custom milik kita)
-# Engine = npm package decolua/9router (upstream, JANGAN diubah/di-fork).
-# Repo ini HANYA berisi kode/supporting custom. Secret TIDAK PERNAH masuk repo.
+# 9Router Supporting Suite
 
-## Isi
-- `key_manager.py` — 9RKM key-manager (auto-off token, reset, kontrol TG/Web)
-- `9rkm-index.html` — Web UI 9RKM (port 8819, Tailscale-only)
-- `9rkm.service` — unit systemd `/etc/systemd/system/9rkm.service`
-- `healthcheck-9router.sh` — watchdog port 20128, auto-restore via restart-9router.sh
-- `gateway-quality-monitor.py` — sensor kualitas gateway (error-rate + canary)
-- `health-models.py` — cek kesehatan model
-- `9r-abort-monitor.py` — monitor abort/TOKEN_REFRESH dari log 9router
-- `daily-key-check.py` — cek harian key
+Supporting tooling for a self-hosted [9Router](https://www.npmjs.com/package/decolua/9router) LLM gateway deployment: an API-key lifecycle manager (9RKM), quality monitors, and watchdogs. Pure Python stdlib + one single-file HTML dashboard. No secrets ever live in this repo.
 
-## Di luar repo (runtime, TIDAK di-commit)
-- `.9router/db/data.sqlite` — provider + keys + traffic (46M, VPS)
-- `jwt-secret`, `auth/` — auth VPS
-- `.env*` apapun — secret (env path dijaga mode 600)
+> The 9Router engine itself is the upstream npm package — this repo only contains custom supporting code around it.
 
-## Deploy note
-- Semua script baca env dari file external (`/home/ubuntu/charon/.env` utk Telegram, BOT_TOKEN di env process)
-- Jangan pernah hardcode secret di file (cek: `grep -rnE 'sk-|API_KEY|SECRET' .`)
+## What's inside
+
+| File | Role |
+|---|---|
+| `key_manager.py` | **9RKM** — key-manager daemon: 5s error scan → auto-OFF, 5-hour reset cycle, retire logic, Web UI + Telegram control |
+| `9rkm-index.html` | 9RKM Web UI (dark theme, single file, no build step) |
+| `9rkm.service` | systemd unit for the daemon |
+| `tg_notify.py` | Shared Telegram notifier (credentials from external env file) |
+| `gateway-quality-monitor.py` | Error-rate sensor + tool-calling canary (anti silent-degradation) |
+| `health-models.py` | Daily health check for every model in a combo; 3 consecutive failures → alert |
+| `9r-abort-monitor.py` | Log tripwire for upstream aborts / token-refresh failures |
+| `healthcheck-9router.sh` | Port watchdog with auto-restore (cron `*/5`) |
+
+## 9RKM — how it works
+
+```
+                 ┌─────────────────────────────────────┐
+ requestDetails ─┤  scan thread (every 5s)             │
+ (gateway log)   │  ≥3 consecutive errors → key OFF    │──► Telegram alert
+                 ├─────────────────────────────────────┤
+                 │  cycle thread (every 5h)            │
+                 │  reset ON all non-retired keys,     │──► SQLite state (kv table)
+                 │  clear errorCode, retire ≥50 cycles │
+                 ├─────────────────────────────────────┤
+                 │  HTTP thread (Web UI + API)         │◄── browser / curl
+                 └─────────────────────────────────────┘
+```
+
+- **Auto-OFF**: a key with ≥3 consecutive errors (or a gateway-set `errorCode`) is deactivated within 5 seconds.
+- **Reset cycle**: every 5 hours all non-retired keys are re-enabled and their error state is cleared — bad keys get re-tested automatically.
+- **Retire**: a key failing ≥50 cycles is marked retired and stays OFF until manual action.
+- **Bulk ops**: ACTIVATE ALL / DEACTIVATE ALL from the Web UI (with confirmation dialog).
+- **Toggle**: the whole auto-OFF mechanism can be paused from the UI; state persists in the gateway's `kv` table.
+
+![9RKM Web UI](docs/9rkm-webui.png)
+
+## Quickstart
+
+```bash
+# 1. credentials file (never committed), e.g. /home/ubuntu/scripts/daily-key-check.env:
+#    BOT_TOKEN=123456:ABC...
+#    CHAT_ID=your-chat-id
+
+# 2. run the daemon
+export ROUTER_DB=/home/ubuntu/.9router/db/data.sqlite
+export TG_ENV=/home/ubuntu/scripts/daily-key-check.env
+export RKM_HTTP_HOST=127.0.0.1        # or your Tailscale IP for remote access
+python3 key_manager.py
+
+# 3. (optional) install as a service
+sudo cp 9rkm.service /etc/systemd/system/ && sudo systemctl enable --now 9rkm
+```
+
+## Configuration
+
+Everything is env-driven; defaults assume a standard VPS layout.
+
+| Env var | Default | Used by |
+|---|---|---|
+| `ROUTER_DB` | `/home/ubuntu/.9router/db/data.sqlite` | all Python scripts |
+| `TG_ENV` | `/home/ubuntu/scripts/daily-key-check.env` | `tg_notify.py` (BOT_TOKEN + CHAT_ID) |
+| `RKM_HTTP_HOST` / `RKM_HTTP_PORT` | `127.0.0.1` / `8819` | `key_manager.py` |
+| `RKM_UI_PATH` | `/home/ubuntu/scripts/9rkm` | `key_manager.py` |
+| `GQM_PUBLIC_PROVIDERS` | *(empty)* | `gateway-quality-monitor.py` — comma-separated provider IDs excluded from error-rate |
+| `GQM_CANARY_MODEL` | *(empty → canary skipped)* | `gateway-quality-monitor.py` |
+| `HM_COMBO` / `HM_VAULT` | `Free` / *(empty)* | `health-models.py` |
+| `HC_LOG` / `HC_VAULT` / `HC_TG_ENV` | VPS paths | `healthcheck-9router.sh` |
+
+## Not in this repo (runtime only)
+
+- `.9router/db/data.sqlite` — provider keys + traffic
+- `jwt-secret`, `auth/` — gateway auth
+- any `.env*` file — credentials (`.gitignore` enforced, files kept mode 600)
+
+## License
+
+MIT

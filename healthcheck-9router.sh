@@ -1,10 +1,10 @@
 #!/bin/bash
 # healthcheck-9router.sh — cek 9router port 20128, auto-restore kalau mati/salah port.
-# DILARANG EDIT tanpa koordinasi Dea. Restart hanya lewat restart-9router.sh (PORT=20128).
-# Cron: */5 * * * * (VPS CST=UTC+8)
+# Restart hanya lewat restart-9router.sh (PORT=20128) — script eksternal, tidak di repo ini.
+# Cron: */5 * * * *
 
-LOG=/home/ubuntu/scripts/healthcheck-9router.log
-VAULT=/home/ubuntu/obsidian-vault
+LOG=${HC_LOG:-/home/ubuntu/scripts/healthcheck-9router.log}
+VAULT=${HC_VAULT:-/home/ubuntu/obsidian-vault}
 STATE=/home/ubuntu/scripts/.hc-9r-state
 TS=$(TZ=Asia/Jakarta date "+%Y-%m-%d %H:%M WIB")
 MAXLOG=2000
@@ -40,25 +40,30 @@ else
   log "RESTORE GAGAL — port 20128 masih kosong"
 fi
 
-# -- notifikasi: vault note + telegram --
-NOTE="$VAULT/03-Daily/insiden-9router-$(TZ=Asia/Jakarta date '+%Y-%m-%d').md"
-{
-  echo "# Insiden 9Router — $TS"
-  echo
-  echo "Port 20128 mati, auto-restore dijalankan. Detail:"
-  echo "- Script: healthcheck-9router.sh"
-  echo "- Restart: restart-9router.sh (PORT=20128)"
-  echo "- Hasil: $RESTORE_OK"
-} >> "$NOTE"
-( cd "$VAULT" && git add -A 2>/dev/null && git commit -m "hc: insiden 9router auto-restore $TS" --quiet 2>/dev/null && git push --quiet 2>/dev/null ) &
-log "vault note + commit triggered"
+# -- notifikasi: vault note (optional) + telegram --
+if [ -d "$VAULT" ]; then
+  NOTE="$VAULT/03-Daily/insiden-9router-$(TZ=Asia/Jakarta date '+%Y-%m-%d').md"
+  {
+    echo "# Insiden 9Router — $TS"
+    echo
+    echo "Port 20128 mati, auto-restore dijalankan. Detail:"
+    echo "- Script: healthcheck-9router.sh"
+    echo "- Restart: restart-9router.sh (PORT=20128)"
+    echo "- Hasil: $RESTORE_OK"
+  } >> "$NOTE"
+  ( cd "$VAULT" && git add -A 2>/dev/null && git commit -m "hc: insiden 9router auto-restore $TS" --quiet 2>/dev/null && git push --quiet 2>/dev/null ) &
+  log "vault note + commit triggered"
+fi
 
-# -- telegram (creds dari charon/.env) --
-if [ -f /home/ubuntu/charon/.env ]; then
-  source <(grep -E "^(TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TELEGRAM_TOPIC_ID)=" /home/ubuntu/charon/.env)
+# -- telegram (creds dari env file eksternal, tidak di-commit) --
+TG_ENV_FILE=${HC_TG_ENV:-/home/ubuntu/scripts/daily-key-check.env}
+if [ -f "$TG_ENV_FILE" ]; then
+  source <(grep -E "^(TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TELEGRAM_TOPIC_ID|BOT_TOKEN|CHAT_ID)=" "$TG_ENV_FILE")
+  TG_BOT=${TELEGRAM_BOT_TOKEN:-$BOT_TOKEN}
+  TG_CHAT=${TELEGRAM_CHAT_ID:-$CHAT_ID}
   MSG="⚠️ 9Router down — auto-restore dijalankan ($TS). Hasil: $RESTORE_OK"
-  curl -s -o /dev/null -m 10 -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
-    --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" \
+  curl -s -o /dev/null -m 10 -X POST "https://api.telegram.org/bot$TG_BOT/sendMessage" \
+    --data-urlencode "chat_id=$TG_CHAT" \
     --data-urlencode "message_thread_id=$TELEGRAM_TOPIC_ID" \
     --data-urlencode "text=$MSG" 2>/dev/null
   log "telegram notify sent"

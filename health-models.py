@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-health-models.py — cek harian kesehatan model di combo Free (9Router VPS).
+health-models.py — cek harian kesehatan model di satu combo 9Router (VPS).
 - Test tiap model via endpoint lokal (parallel, 8 worker).
-- 3 hari gagal berturut-turut (non-429) = ALERT ke Telegram (Tidak auto-drop).
-- Notify: vault note + Telegram.
-State: ~/.9router/health-models-state.json
-Log:   ~/scripts/health-models.log
+- 3 hari gagal berturut-turut (non-429) = ALERT ke Telegram (tidak auto-drop).
+- Notify: Telegram (+ optional vault note jika HM_VAULT diset).
+Env: ROUTER_DB, HM_API, HM_STATE, HM_LOG, HM_COMBO, HM_VAULT.
 """
 import json, os, subprocess, datetime, sys, urllib.request, concurrent.futures
 import tg_notify
 
-DB = "/home/ubuntu/.9router/db/data.sqlite"
-COMBO = "Free"
-API = "http://localhost:20128/v1/chat/completions"
-STATE = "/home/ubuntu/.9router/health-models-state.json"
-LOG = "/home/ubuntu/scripts/health-models.log"
+DB = os.environ.get("ROUTER_DB", "/home/ubuntu/.9router/db/data.sqlite")
+COMBO = os.environ.get("HM_COMBO", "Free")
+API = os.environ.get("HM_API", "http://localhost:20128/v1/chat/completions")
+STATE = os.environ.get("HM_STATE", "/home/ubuntu/.9router/health-models-state.json")
+LOG = os.environ.get("HM_LOG", "/home/ubuntu/scripts/health-models.log")
+VAULT = os.environ.get("HM_VAULT", "")
 MAX_FAIL = 3
 TIMEOUT = 30
 MAX_WORKERS = 8
@@ -121,13 +121,12 @@ def main():
     if alerts:
         msg = f"🩺 Health-Models {COMBO} Alert\n\n" + "\n".join(alerts)
         log(f"ALERT DIKIRIM: {len(alerts)} peringatan")
-        # vault note
-        vault = "/home/ubuntu/obsidian-vault"
-        note = f"{vault}/03-Daily/health-models-alert-{datetime.date.today()}.md"
-        with open(note, "w") as f:
-            f.write(f"# Health Models Alert — {datetime.date.today()}\n\n" + "\n".join(alerts) + f"\n\nCek dasbor manual.\n")
-        subprocess.run(["bash", "-c", f"cd {vault} && git add -A && git commit -m 'health-models: peringatan manual' --quiet && git push --quiet"],
-                       timeout=30, capture_output=True)
+        if VAULT:
+            note = f"{VAULT}/03-Daily/health-models-alert-{datetime.date.today()}.md"
+            with open(note, "w") as f:
+                f.write(f"# Health Models Alert — {datetime.date.today()}\n\n" + "\n".join(alerts) + f"\n\nCek dasbor manual.\n")
+            subprocess.run(["bash", "-c", f"cd {VAULT} && git add -A && git commit -m 'health-models: peringatan manual' --quiet && git push --quiet"],
+                           timeout=30, capture_output=True)
         notify_telegram(msg)
     else:
         log(f"SEHAT semua ({len(combo)} model), tidak ada alert")

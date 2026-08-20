@@ -1,45 +1,17 @@
 #!/usr/bin/env python3
 """9Router abort monitor — tripwire: ERROR terminated / Fetch.onAborted (upstream socket mati)
 dan TOKEN_REFRESH failed (kredensial). ⚡ DISCONNECT (client abort) TIDAK dipantau — normal.
-Notif Telegram via kredensial auto-worker/.env (DM Dea)."""
+Notif Telegram via kredensial env file (TG_ENV)."""
 import os
 import re
 import sys
-import urllib.parse
-import urllib.request
+
+os.environ.setdefault("TG_ENV", "/home/ubuntu/auto-worker/.env")
+from tg_notify import notify
 
 LOG = "/home/ubuntu/.pm2/logs/9router-out.log"
 OFFSET = "/tmp/9r-monitor-offset"
-ENV = "/home/ubuntu/auto-worker/.env"
-FALLBACK_CHAT = "355679325"
 PAT = re.compile(r"ERROR: terminated|Fetch\.onAborted|TOKEN_REFRESH\] (All \d+ retry attempts failed|failed)", re.I)
-
-def creds():
-    vals = {}
-    try:
-        with open(ENV) as f:
-            for line in f:
-                if "=" in line and not line.strip().startswith("#"):
-                    k, _, v = line.strip().partition("=")
-                    vals[k] = v
-    except Exception:
-        pass
-    return vals.get("TELEGRAM_BOT_TOKEN"), vals.get("TELEGRAM_CHAT_ID") or FALLBACK_CHAT
-
-def notify(msg):
-    bot, chat = creds()
-    if not bot:
-        print("[-] TELEGRAM_BOT_TOKEN tidak ditemukan, skip")
-        return False
-    data = urllib.parse.urlencode({"chat_id": chat, "text": msg}).encode()
-    try:
-        with urllib.request.urlopen(
-            f"https://api.telegram.org/bot{bot}/sendMessage", data=data, timeout=15
-        ) as r:
-            return r.status == 200
-    except Exception as e:
-        print("telegram error:", e)
-        return False
 
 def main():
     if not os.path.exists(LOG):

@@ -8,13 +8,12 @@ Satu daemon menggantikan key-disable-daemon.py + daily-key-check.py + hourly-key
 Toggle di scope KV 'key_auto_off_toggle' - terpisah dari state 'hourly_key_disable'.
 """
 import sys, os, time, json, sqlite3, html, datetime, threading
-import urllib.request, urllib.error, urllib.parse
 import http.server, socketserver
+from tg_notify import notify
 
 DB = os.environ.get("ROUTER_DB", "/home/ubuntu/.9router/db/data.sqlite")
-ENV = os.environ.get("ROUTER_ENV", "/home/ubuntu/scripts/daily-key-check.env")
 UI_PATH = os.environ.get("RKM_UI_PATH", "/home/ubuntu/scripts/9rkm")
-HTTP_HOST = os.environ.get("RKM_HTTP_HOST", "100.82.126.88")
+HTTP_HOST = os.environ.get("RKM_HTTP_HOST", "127.0.0.1")
 HTTP_PORT = int(os.environ.get("RKM_HTTP_PORT", "8819"))
 KV_SCOPE = "hourly_key_disable"
 KV_KEY = "state"
@@ -46,33 +45,6 @@ def get_cycle_id(now=None):
 def get_cutoff_iso(hours=1):
     dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-def load_env():
-    vals = {}
-    if os.path.exists(ENV):
-        with open(ENV, encoding="utf-8") as f:
-            for line in f:
-                if "=" in line and not line.strip().startswith("#"):
-                    k, _, v = line.strip().partition("=")
-                    vals[k.strip()] = v.strip()
-    return vals
-
-def notify(msg):
-    env = load_env()
-    bot = env.get("BOT_TOKEN")
-    chat = env.get("CHAT_ID", "355679325")
-    if not bot:
-        return
-    esc = html.escape(msg, quote=False)
-    html_msg = esc.replace("&lt;b&gt;", "<b>").replace("&lt;/b&gt;", "</b>").replace("&lt;code&gt;", "<code>").replace("&lt;/code&gt;", "</code>").replace("&lt;i&gt;", "<i>").replace("&lt;/i&gt;", "</i>")
-    for params in ({"parse_mode": "HTML", "text": html_msg}, {"text": msg}):
-        data = urllib.parse.urlencode({"chat_id": chat, **params}).encode()
-        try:
-            with urllib.request.urlopen(f"https://api.telegram.org/bot{bot}/sendMessage", data=data, timeout=10) as r:
-                if r.status == 200:
-                    return
-        except Exception:
-            pass
 
 def provider_label(provider, data=None):
     specific = data.get("providerSpecificData") if isinstance(data, dict) else None

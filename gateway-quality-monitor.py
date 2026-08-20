@@ -1,31 +1,27 @@
 #!/usr/bin/env python3
 """
 gateway-quality-monitor.py — sensor kualitas gateway 9Router (anti silent-degradation).
-- Error-rate window (default 6 jam) dari requestDetails untuk provider MILIK KITA
-  (provider publik yang diketahui di-blacklist — mereka error sendiri bukan masalah kita).
-- rate > 10% -> alert Telegram + state dedupe (max 1x/5 jam).
-- Canary: replikasi request meridian (tools + tool_choice auto) ke ocg/deepseek-v4-flash
-  -> harus HTTP 200. Gagal = regresi upstream -> alert.
+- Error-rate window (default 6 jam) dari requestDetails, provider publik yang
+  diketahui di-blacklist dikecualikan (mereka error sendiri bukan masalah kita).
+- rate > threshold -> alert Telegram + state dedupe (max 1x/5 jam).
+- Canary: replikasi request tool-calling ke satu model -> harus HTTP 200.
+  Gagal = regresi upstream -> alert.
 - Args: --dry-run (print saja) | --hours N
+Env: GQM_PUBLIC_PROVIDERS (comma-separated provider IDs yang dikecualikan),
+     GQM_CANARY_MODEL (model canary; canary skip jika kosong).
 State: ~/.9router/gateway-quality-state.json  Log: ~/scripts/gateway-quality.log
 """
 import json, os, subprocess, sys, datetime, urllib.request, urllib.error
 
 import tg_notify
 
-DB = "/home/ubuntu/.9router/db/data.sqlite"
-API = "http://localhost:20128/v1/chat/completions"
-STATE = "/home/ubuntu/.9router/gateway-quality-state.json"
-LOG = "/home/ubuntu/scripts/gateway-quality.log"
-# Provider user publik (error mereka bukan masalah konfigurasi kita)
-PUBLIC_PROVIDERS = {
-    "openai-compatible-chat-766044ec-1137-4f87-ad22-42ccc998d898",  # zenmux
-    "openai-compatible-chat-702fb81f-b075-4abf-82c4-c30d31087da5",  # madewgn
-    "openai-compatible-chat-6df221de-7bac-4ba4-8297-464ab9493d1f",  # gorouter
-    "openai-compatible-chat-531fd54b-b981-4796-95cb-dd9223c7d0e2",  # aiand
-    "openai-compatible-chat-88ac9f54-9ccc-43a2-9a37-c0d6e098e1d4",  # inferx
-    "opencode",  # zen (opencode.ai) — dipakai user publik
-}
+DB = os.environ.get("ROUTER_DB", "/home/ubuntu/.9router/db/data.sqlite")
+API = os.environ.get("GQM_API", "http://localhost:20128/v1/chat/completions")
+STATE = os.environ.get("GQM_STATE", "/home/ubuntu/.9router/gateway-quality-state.json")
+LOG = os.environ.get("GQM_LOG", "/home/ubuntu/scripts/gateway-quality.log")
+# Provider publik milik pihak lain (error mereka bukan masalah konfigurasi kita)
+PUBLIC_PROVIDERS = {p.strip() for p in os.environ.get("GQM_PUBLIC_PROVIDERS", "").split(",") if p.strip()}
+CANARY_MODEL = os.environ.get("GQM_CANARY_MODEL", "")
 THRESHOLD = 0.12
 DEDUPE_H = 5
 CANARY_TIMEOUT = 40
@@ -70,11 +66,14 @@ def main():
     state = load_state()
 
     # ---- 1. Error rate provider kita ----
-    whitelist = ",".join(f"'{p}'" for p in PUBLIC_PROVIDERS)
+    excl = ""
+    if PUBLIC_PROVIDERS:
+        whitelist = ",".join(f"'{p}'" for p in PUBLIC_PROVIDERS)
+        excl = f"AND provider NOT IN ({whitelist}) "
     rows = db(
         f"SELECT status, count(*) FROM requestDetails "
         f"WHERE timestamp > datetime('now','-{hours} hours') "
-        f"AND provider NOT IN ({whitelist}) GROUP BY status;"
+        f"{excl}GROUP BY status;"
     ).strip().splitlines()
     total = err = 0
     for line in rows:
@@ -90,7 +89,7 @@ def main():
     top = db(
         f"SELECT provider, model, count(*) FROM requestDetails "
         f"WHERE timestamp > datetime('now','-{hours} hours') "
-        f"AND status != 'success' AND provider NOT IN ({whitelist}) "
+        f"AND status != 'success' {excl}"
         f"GROUP BY provider, model ORDER BY 3 DESC LIMIT 5;"
     ).strip()
 
@@ -108,13 +107,17 @@ def main():
     elif dry and total >= 20 and rate > THRESHOLD:
         log("[dry-run] rate di atas threshold — akan alert")
 
-    # ---- 2. Canary (replikasi request meridian) ----
+    # ---- 2. Canary (request tool-calling ke satu model) ----
+    if not CANARY_MODEL:
+        log("canary: skip (GQM_CANARY_MODEL tidak diset)")
+        save_state(state)
+        return
     body = json.dumps({
-        "model": "ocg/deepseek-v4-flash",
-        "messages": [{"role": "system", "content": "You are an autonomous DLMM LP agent. Role: SCREENER. Call deploy_position."},
-                     {"role": "user", "content": '{"task":"pick best","candidates":[{"mint":"abc123"}]}'}],
-        "tools": [{"type": "function", "function": {"name": "deploy_position", "description": "deploy position",
-                    "parameters": {"type": "object", "properties": {"mint": {"type": "string"}}, "required": ["mint"]}}}],
+        "model": CANARY_MODEL,
+        "messages": [{"role": "system", "content": "You are a canary probe. Call the provided tool."},
+                     {"role": "user", "content": '{"task":"ping"}'}],
+        "tools": [{"type": "function", "function": {"name": "ping", "description": "ping",
+                    "parameters": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}}}],
         "tool_choice": "auto", "temperature": 0.2, "max_tokens": 2000,
     }).encode()
     req = urllib.request.Request(API, data=body, headers={
@@ -131,12 +134,12 @@ def main():
                 canary_info = d["model"]
     except (urllib.error.HTTPError, urllib.error.URLError, OSError, json.JSONDecodeError) as e:
         canary_info = str(e)
-    log(f"canary ocg/deepseek-v4-flash: {'OK' if canary_ok else 'FAIL'} ({canary_info})")
+    log(f"canary {CANARY_MODEL}: {'OK' if canary_ok else 'FAIL'} ({canary_info})")
 
     last_fail = state.get("lastCanaryFailTs", 0)
     if not dry and not canary_ok and now - last_fail > DEDUPE_H * 3600:
-        tg_notify.notify(f"🚨 CANARY GAGAL: ocg/deepseek-v4-flash (tool_choice auto) — {canary_info}\n"
-                         f"Regresi upstream kemungkinan — meridian/charon bisa terdampak. Cek gateway.")
+        tg_notify.notify(f"🚨 CANARY GAGAL: {CANARY_MODEL} (tool_choice auto) — {canary_info}\n"
+                         f"Regresi upstream kemungkinan — traffic gateway bisa terdampak. Cek gateway.")
         state["lastCanaryFailTs"] = now
         log("ALERT canary terkirim")
 

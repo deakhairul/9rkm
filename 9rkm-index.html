@@ -29,7 +29,14 @@
   table{width:100%;border-collapse:collapse;font-size:13px;margin-top:10px}
   th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
   th{color:var(--dim);font-weight:600;font-size:11px;text-transform:uppercase}
+  .pill{padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700;white-space:nowrap}
+  .pill.aktif{background:#123525;color:var(--ok)}
+  .pill.off{background:#3a1414;color:var(--bad)}
+  .pill.pensiun{background:#1c2330;color:#a0aac0;border:1px dashed #2a3344}
+  .pill.manual{background:#3a1414;color:var(--bad);border:1px dashed var(--bad)}
   .bulk-row{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap}
+  .btn.remap{background:#1a2330;color:#7ec8ff;border:1px solid #4da3ff}
+  .btn.remap:disabled{opacity:.45}
   .btn.bulk{flex:1;min-width:160px}
   .btn.activate{background:#123525;color:var(--ok);border:1px solid var(--ok)}
   .btn.deactivate{background:#3a1414;color:var(--bad);border:2px dashed var(--bad)}
@@ -49,6 +56,7 @@
       <div>
         <div style="font-size:14px;font-weight:700">Key Manager</div>
         <div class="log" id="toggleinfo">-</div>
+      <div class="log" id="cycleinfo" style="margin-top:6px;font-weight:600"></div>
       </div>
       <span class="badge off" id="badge">…</span>
     </div>
@@ -65,12 +73,18 @@
       <div class="stat"><div class="v" id="sRetired">-</div><div class="l">PENSIUN (tetap OFF)</div></div>
       <div class="stat"><div class="v" id="sProv">-</div><div class="l">PROVIDER</div></div>
     </div>
+    <div class="log" id="remaplog" style="margin-top:10px"></div>
     <div class="bulk-row">
+      <button class="btn bulk remap" id="bRemap">🔄 REMAP COMBO</button>
       <button class="btn bulk activate" id="bBulkOn">⚡ ACTIVATE ALL KEY</button>
       <button class="btn bulk deactivate" id="bBulkOff">⛔ DEACTIVATE ALL KEY</button>
     </div>
     <div class="log" id="bulklog"></div>
     <table id="tbl"><tr><th>Provider</th><th>Aktif</th></tr></table>
+    <div style="margin-top:14px;font-size:13px;font-weight:700">Detail Key</div>
+    <div style="overflow-x:auto;max-height:60vh;overflow-y:auto;border:1px solid var(--line);border-radius:10px;margin-top:8px">
+      <table id="tblKeys"><tr><th>Key</th><th>Provider</th><th>Status</th><th>Keterangan</th></tr></table>
+    </div>
     <div class="log" id="log"></div>
   </div>
 
@@ -102,6 +116,7 @@ function render(s) {
   b.className = 'badge ' + (on ? 'on' : 'off');
   const t = s.toggle || {};
   $('toggleinfo').textContent = (t.by ? 'by ' + t.by + ' @ ' + (t.at || '') : 'default ON');
+  (function(){const c=s.cycle; if(!c){ $('cycleinfo').textContent=''; return; } let rem=Math.max(0,c.remainingSec|0); const tick=()=>{let r=Math.max(0,rem--); let h=Math.floor(r/3600), m=Math.floor((r%3600)/60), s2=r%60; const pad=n=>String(n).padStart(2,'0'); const txt=c.enabled?'⏰ Auto ON: '+c.wib+' (in '+h+'j '+pad(m)+'m '+pad(s2)+'s)':'⏸ Auto ON jeda (toggle OFF) — berikutnya jika ON: '+c.wib+' ('+h+'j '+pad(m)+'m)'; $('cycleinfo').textContent=txt; if(r<=0) $('cycleinfo').textContent+=' — refresh...';}; tick(); if(window._cycleTimer) clearInterval(window._cycleTimer); window._cycleTimer=setInterval(tick,1000);})();
   $('bOn').disabled = on;
   $('bOff').disabled = !on;
   $('sActive').textContent = s.active + ' / ' + s.total;
@@ -113,6 +128,20 @@ function render(s) {
     const tr = tb.insertRow();
     tr.insertCell().textContent = p.provider;
     tr.insertCell().textContent = p.count;
+  });
+  const tk = $('tblKeys');
+  while (tk.rows.length > 1) tk.deleteRow(1);
+  const pillCls = st => st==='Aktif'?'aktif':st==='OFF'?'off':st==='Pensiun'?'pensiun':'manual';
+  (s.keys || []).forEach(k => {
+    const tr = tk.insertRow();
+    tr.insertCell().textContent = k.key;
+    tr.insertCell().textContent = k.provider;
+    const tdS = tr.insertCell();
+    const sp = document.createElement('span');
+    sp.className = 'pill ' + pillCls(k.status);
+    sp.textContent = k.status;
+    tdS.appendChild(sp);
+    tr.insertCell().textContent = k.ket || '-';
   });
   const rc = $('retiredCard');
   if (s.retired_count > 0) {
@@ -154,6 +183,44 @@ function renderBulk(s){showBulk(s)}
 const _renderOrig = render;
 render = function(s){_renderOrig(s);renderBulk(s)}
 
+function renderRemap(s){
+  const r=s.remap||{};
+  const el=document.getElementById('remaplog');
+  if(!el) return;
+  let txt='';
+  if(r.locked) txt+='⏳ remap sedang jalan… ';
+  if(r.cooldownSec>0) txt+=`cooldown ${Math.ceil(r.cooldownSec/60)}m `;
+  if(r.lastWib) txt+=`last ${r.lastWib} src=${r.source||'-'} Intel ${r.intel??'-'} Agentic ${r.agentic??'-'} Vision ${r.vision??'-'} | cache ${r.cacheAgeH!=null?r.cacheAgeH+'j':'-'} `;
+  else if(r.cacheAt) txt+=`cache ${r.cacheAgeH}j `;
+  el.textContent=txt;
+  const btn=document.getElementById('bRemap');
+  if(btn) btn.disabled=!!r.locked|| (r.cooldownSec>0);
+  if(btn && r.cooldownSec>0) btn.title=`cooldown ${r.cooldownSec}s (force pakai checkbox)`;
+  else if(btn) btn.title='';
+}
+const _renderOrig2 = render;
+render = function(s){_renderOrig2(s);renderRemap(s)}
+
+async function doRemap(force){
+  const btn=document.getElementById('bRemap');
+  if(btn) btn.disabled=true;
+  const el=document.getElementById('remaplog');
+  try{
+    const r=await api('/api/remap',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({force:!!force})});
+    if(el) el.textContent='⏳ remap started force='+force+' — tunggu 30-60s lalu refresh';
+    setTimeout(refresh, 4000);
+  }catch(e){
+    let msg=e.message;
+    try{ const j=JSON.parse(e.message); msg=j.reason||msg; }catch(_){}
+    if(el) el.textContent='Gagal remap: '+msg;
+    try{
+      const s=await api('/api/status');
+      render(s);
+    }catch(_){}
+  }finally{
+    setTimeout(()=>{ const b=document.getElementById('bRemap'); if(b) b.disabled=false; }, 2000);
+  }
+}
 async function bulk(action){
   const path = action==='on' ? '/api/keys/activate_all' : '/api/keys/deactivate_all';
   $('bBulkOn').disabled=$('bBulkOff').disabled=true;
@@ -164,6 +231,7 @@ async function bulk(action){
 $('bOn').onclick = () => toggle(true);
 $('bOff').onclick = () => toggle(false);
 $('bBulkOn').onclick = () => $('dlgOn').showModal();
+const _bRemap=document.getElementById('bRemap'); if(_bRemap) _bRemap.onclick=()=>{ const force=confirm('Force = tarik API 1x dulu (jika 429 fallback DB). OK=force, Cancel=pakai cache DB langsung'); doRemap(force); };
 $('bBulkOff').onclick = () => {$('dlgOffInput').value='';$('dlgOff').showModal();};
 $('dlgOn').addEventListener('close',()=>{if($('dlgOn').returnValue==='ok')bulk('on')});
 $('dlgOff').addEventListener('close',()=>{if($('dlgOff').returnValue==='ok' && $('dlgOffInput').value.trim()==='OFF')bulk('off');else if($('dlgOff').returnValue==='ok')$('bulklog').textContent='Batal: ketik OFF tidak cocok';});

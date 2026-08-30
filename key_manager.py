@@ -10,12 +10,12 @@ Toggle di scope KV 'key_auto_off_toggle' - terpisah dari state 'hourly_key_disab
 import sys, os, time, json, sqlite3, html, datetime, threading
 import urllib.request, urllib.error, urllib.parse
 import http.server, socketserver
-from tg_notify import notify
+import pathlib, subprocess
 
 DB = os.environ.get("ROUTER_DB", "/home/ubuntu/.9router/db/data.sqlite")
 ENV = os.environ.get("ROUTER_ENV", "/home/ubuntu/scripts/daily-key-check.env")
 UI_PATH = os.environ.get("RKM_UI_PATH", "/home/ubuntu/scripts/9rkm")
-HTTP_HOST = os.environ.get("RKM_HTTP_HOST", "127.0.0.1")
+HTTP_HOST = os.environ.get("RKM_HTTP_HOST", "100.82.126.88")
 HTTP_PORT = int(os.environ.get("RKM_HTTP_PORT", "8819"))
 KV_SCOPE = "hourly_key_disable"
 KV_KEY = "state"
@@ -25,18 +25,21 @@ MAX_FAILED_CYCLES = 50
 CYCLE_HOURS = 5
 CYCLE_SECONDS = CYCLE_HOURS * 3600
 SLEEP_INTERVAL = 5
-EC_HINT = {400: "Request salah", 401: "Kunci salah/expired, ganti key", 402: "Perlu bayar, saldo habis", 403: "Akses ditolak (blokir/belum bayar)", 429: "Kuota habis, tunggu isi ulang"}
+REMAP_LOCK = "/tmp/9rkm-remap.lock"
+REMAP_DEBOUNCE_SEC = 1800
+REMAP_LOG = "/tmp/aa_remap_last.log"
+EC_HINT = {400: "Request salah", 401: "Kunci salah/expired", 402: "Saldo habis", 403: "Akses ditolak", 429: "Kuota habis"}
 
 def _hint(ec):
     try:
         c = int(str(ec).strip())
     except Exception:
-        return f"Error gateway kode {ec}"
+        return f"Error {ec}"
     if c in EC_HINT:
         return EC_HINT[c]
     if 500 <= c <= 599:
-        return "Gangguan server gateway"
-    return f"Error gateway kode {c}"
+        return "Gangguan gateway"
+    return f"Error {c}"
 
 def log(msg):
     ts = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7))).strftime("%Y-%m-%d %H:%M:%S WIB")
@@ -70,6 +73,26 @@ def load_env():
                     vals[k.strip()] = v.strip()
     return vals
 
+ALERTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web_alerts.json")
+
+def _web_alert(msg):
+    # Telegram OFF 26 Agu 2026 (AGENTS.md 17.8) — alert pindah ke file Web
+    try:
+        import datetime as _dt
+        arr = []
+        if os.path.exists(ALERTS_PATH):
+            try:
+                arr = json.load(open(ALERTS_PATH, encoding="utf-8"))
+            except Exception:
+                arr = []
+        arr.append({"ts": _dt.datetime.now().isoformat(timespec="seconds"), "source": "9rkm", "text": msg})
+        json.dump(arr[-500:], open(ALERTS_PATH, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+    log(f"[web-alert] {msg}")
+
+def notify(msg):
+    _web_alert(msg)
 
 def provider_label(provider, data=None):
     specific = data.get("providerSpecificData") if isinstance(data, dict) else None
@@ -79,6 +102,109 @@ def provider_label(provider, data=None):
             if isinstance(value, str) and value.strip():
                 return value.strip()
     return provider or "unknown"
+
+def _remap_snapshot(cursor):
+    out = {"lastAt": None, "lastWib": None, "source": None, "intel": None, "agentic": None, "vision": None, "cacheAt": None, "cacheAgeH": None, "locked": False, "cooldownSec": 0}
+    try:
+        cursor.execute("SELECT value FROM kv WHERE scope=? AND key=?", ("aa_cache", "state"))
+        r = cursor.fetchone()
+        if r and r["value"]:
+            import json as _js
+            j = _js.loads(r["value"])
+            out["cacheAt"] = j.get("at")
+            if j.get("at"):
+                try:
+                    dt = datetime.datetime.fromisoformat(j["at"].replace("Z","+00:00"))
+                    out["cacheAgeH"] = round((datetime.datetime.now(datetime.timezone.utc)-dt).total_seconds()/3600,1)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    try:
+        cursor.execute("SELECT value FROM kv WHERE scope=? AND key=?", ("aa_remap", "state"))
+        r = cursor.fetchone()
+        if r and r["value"]:
+            import json as _js2
+            j = _js2.loads(r["value"])
+            out["lastAt"] = j.get("at")
+            out["source"] = j.get("source")
+            out["intel"] = j.get("intel")
+            out["agentic"] = j.get("agentic")
+            out["vision"] = j.get("vision")
+            if j.get("at"):
+                try:
+                    dt = datetime.datetime.fromisoformat(j["at"].replace("Z","+00:00"))
+                    wib = dt.astimezone(datetime.timezone(datetime.timedelta(hours=7)))
+                    out["lastWib"] = wib.strftime("%d %b %H:%M WIB")
+                except Exception:
+                    pass
+                try:
+                    dt = datetime.datetime.fromisoformat(j["at"].replace("Z","+00:00"))
+                    age = (datetime.datetime.now(datetime.timezone.utc)-dt).total_seconds()
+                    remain = REMAP_DEBOUNCE_SEC - age
+                    out["cooldownSec"] = int(remain) if remain>0 else 0
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    try:
+        if os.path.exists(REMAP_LOCK):
+            age = time.time() - os.path.getmtime(REMAP_LOCK)
+            if age < 300:
+                out["locked"] = True
+            else:
+                try:
+                    os.remove(REMAP_LOCK)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return out
+
+def _run_remap_async(force=False):
+    def worker():
+        try:
+            if os.path.exists(REMAP_LOCK) and (time.time()-os.path.getmtime(REMAP_LOCK) < 300):
+                log("[Remap] locked skip")
+                return
+            pathlib.Path(REMAP_LOCK).write_text(str(os.getpid()))
+        except Exception as e:
+            log(f"[Remap] lock fail {e}")
+            return
+        try:
+            log(f"[Remap] start force={force}")
+            out = ""
+            if force:
+                try:
+                    r = subprocess.run(["/usr/bin/python3","/home/ubuntu/scripts/9rkm/aa_rank.py","--fetch"], capture_output=True, text=True, timeout=60)
+                    out += (r.stdout or "")[-2000:] + (r.stderr or "")[-2000:]
+                    log(f"[Remap] fetch exit={r.returncode}")
+                except Exception as e:
+                    out += f" fetch err {e}"
+            try:
+                child_env = {**os.environ, "AA_REMAP_LOCK_HELD": "1"}
+                r2 = subprocess.run(["/usr/bin/python3","/home/ubuntu/scripts/9rkm/aa_rank.py","--remap"], capture_output=True, text=True, timeout=180, env=child_env)
+                out += "\n---remap---\n" + (r2.stdout or "")[-3000:] + (r2.stderr or "")[-3000:]
+                log(f"[Remap] remap exit={r2.returncode}")
+                if r2.returncode == 0:
+                    try:
+                        subprocess.run(["pm2","restart","9router"], timeout=15)
+                    except Exception as ex:
+                        log(f"[Remap] pm2 fail {ex}")
+            except Exception as e:
+                out += f" remap err {e}"
+            try:
+                pathlib.Path(REMAP_LOG).write_text(out[-8000:], encoding="utf-8")
+            except Exception:
+                pass
+            notify(f"Remap combo selesai force={force} @ {get_iso_now()}")
+        finally:
+            try:
+                os.remove(REMAP_LOCK)
+            except Exception:
+                pass
+    threading.Thread(target=worker, daemon=True).start()
+
 
 # ---------- KV state ----------
 
@@ -125,7 +251,7 @@ def set_toggle(enabled, by):
 
 
 
-def candidates_from_error_code(active_map, requests_by_conn):
+def candidates_from_error_code(active_map, requests_by_conn, cutoff_iso, bulk_at_iso=None, bulk_grace_iso=None):
     found = []
     for cid, info in active_map.items():
         d = info.get("data")
@@ -134,21 +260,36 @@ def candidates_from_error_code(active_map, requests_by_conn):
         ec = d.get("errorCode")
         if ec is None:
             continue
+        try:
+            if int(str(ec).strip()) == 400:
+                lbl = str(info.get("label", "")).strip().lower()
+                if lbl == "bynara":
+                    continue
+                last_err = str(d.get("lastError") or "")
+                if "model rejected this request" in last_err:
+                    continue
+        except Exception:
+            pass  # ponytail: 400 is payload-specific; Bynara=>skip always, others=>skip only if "model rejected" (request-invalid), not invalid-key 400 — credential 401/403/429 still OFF
         reqs = requests_by_conn.get(cid, [])
         success_ts = None
         for ts, status, _ in reversed(reqs):
             if str(status).strip().lower() == "success":
                 success_ts = ts
                 break
-        err_ts = d.get("lastErrorAt") or info.get("updatedAt") or ""
-        if success_ts and err_ts and success_ts > err_ts:
+        err_ts = d.get("lastErrorAt")
+        if not err_ts or err_ts < cutoff_iso:
+            continue
+        if bulk_at_iso and err_ts <= bulk_at_iso:
+            continue
+        if bulk_grace_iso and err_ts <= bulk_grace_iso:
+            continue  # ponytail: grace 10s pasca-bulk; naikkan ke 30s jika gateway rewrite >10s, hapus jika mau strict err>bulk
+        if success_ts and success_ts > err_ts:
             continue
         found.append({
             "connectionId": cid,
             "consecutive_errors": 1,
             "total_in_window": len(reqs),
-            "ec": ec,
-            "last_reason": _hint(ec),
+            "last_reason": f"errorCode {ec} (state gateway)",
             "_source": "errorCode",
         })
     return found
@@ -158,6 +299,8 @@ def run_scan_tick():
     today_wib = now_wib.strftime("%Y-%m-%d")
     cutoff_iso = get_cutoff_iso(1)
     now_iso = get_iso_now()
+    bulk_at_iso = None
+    bulk_grace_iso = None
 
     conn = get_db()
     try:
@@ -197,6 +340,18 @@ def run_scan_tick():
             cid = row["connectionId"]
             requests_by_conn.setdefault(cid, []).append((row["timestamp"], row["status"], row["data"]))
 
+        try:
+            _bulk = load_state_from_db(cursor, BULK_SCOPE, BULK_KEY)
+            bulk_at_iso = _bulk.get("at") if isinstance(_bulk, dict) else None
+            if bulk_at_iso:
+                try:
+                    _dt = datetime.datetime.fromisoformat(bulk_at_iso.replace("Z", "+00:00"))
+                    _dt_g = _dt + datetime.timedelta(seconds=10)
+                    bulk_grace_iso = _dt_g.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_dt_g.microsecond//1000:03d}Z"
+                except Exception:
+                    bulk_grace_iso = None
+        except Exception:
+            pass
         state = load_state_from_db(cursor)
         current_cycle = get_cycle_id()
         for cid, reqs in requests_by_conn.items():
@@ -208,7 +363,7 @@ def run_scan_tick():
                     state[cid].pop("counted_cycle_id", None)
                     state[cid]["is_retired"] = False
 
-        candidates = candidates_from_error_code(active_map, requests_by_conn)
+        candidates = candidates_from_error_code(active_map, requests_by_conn, cutoff_iso, bulk_at_iso, bulk_grace_iso)
 
         if not candidates:
             save_state_to_db(cursor, state)
@@ -240,11 +395,8 @@ def run_scan_tick():
             conn_state.pop("consecutive_off_days", None)
             conn_state["last_off_date"] = today_wib
             state[cid] = conn_state
-            ec = html.escape(str(c.get("ec", "")))
-            hint = html.escape(c.get("last_reason", ""))
-            acct = html.escape((info.get("email") or name[:20] or "-"))
-            siklus = conn_state.get('failed_cycles', 1)
-            off_list_msg.append(f"• <b>{html.escape(prov)}</b> | {acct} | {ec} | {hint} | S{siklus}")
+            src_label = "errorCode" if c.get("_source") == "errorCode" else f"{c['consecutive_errors']}x err"
+            off_list_msg.append(f"• <b>{html.escape(prov)}</b> ({html.escape(name[:20])}) — {src_label} ({html.escape(c['last_reason'])}) [Siklus ke-{conn_state.get('failed_cycles', 1)}]")
 
         save_state_to_db(cursor, state)
         conn.commit()
@@ -456,14 +608,19 @@ def status_snapshot():
             label = provider_label(row["provider"], data)
             provider_counts[label] = provider_counts.get(label, 0) + 1
         by_prov = [{"provider": label, "count": count} for label, count in sorted(provider_counts.items(), key=lambda item: (-item[1], item[0]))]
-        cur.execute("SELECT id, provider, name, data FROM providerConnections;")
+        cur.execute("SELECT id, provider, name, email, isActive, data FROM providerConnections ORDER BY provider, name;")
+        conn_rows = cur.fetchall()
         connection_labels = {}
-        for row in cur.fetchall():
+        conn_data = {}
+        for row in conn_rows:
             try:
                 data = json.loads(row["data"]) if row["data"] else {}
             except Exception:
                 data = {}
+            if not isinstance(data, dict):
+                data = {}
             connection_labels[row["id"]] = (provider_label(row["provider"], data), row["name"] or row["provider"])
+            conn_data[row["id"]] = data
         state = load_state_from_db(cur)
         retired = []
         for cid, item in state.items():
@@ -471,6 +628,47 @@ def status_snapshot():
                 label, fallback_name = connection_labels.get(cid, (item.get("provider", "unknown"), item.get("name", "-")))
                 retired.append({"provider": label, "name": item.get("name") or fallback_name, "failed_cycles": item.get("failed_cycles", 0)})
         bulk_last = load_state_from_db(cur, BULK_SCOPE, BULK_KEY)
+        keys = []
+        for row in conn_rows:
+            cid = row["id"]
+            d = conn_data.get(cid, {})
+            prov_label = provider_label(row["provider"], d)
+            name = (row["name"] or "").strip() or (row["email"] or "").strip() or cid[:8]
+            st = state.get(cid, {})
+            failed = st.get("failed_cycles", st.get("consecutive_off_days", 0))
+            if st.get("manual_off"):
+                status = "Manual OFF"
+            elif st.get("is_retired"):
+                status = "Pensiun"
+            elif not row["isActive"]:
+                status = "OFF"
+            else:
+                status = "Aktif"
+            ec = d.get("errorCode")
+            last_err = d.get("lastError") or ""
+            last_err = " ".join(str(last_err).split())[:80] if last_err else ""
+            ket = "-"
+            if ec is not None:
+                ket = f"{ec} {_hint(ec)}"
+                if last_err:
+                    ket += f" · {last_err}"
+                if failed:
+                    ket += f" · S{failed}"
+            elif not row["isActive"] and failed:
+                ket = f"S{failed}"
+            elif not row["isActive"] and last_err:
+                ket = last_err
+            keys.append({"key": name, "provider": prov_label, "status": status, "ket": ket})
+        keys.sort(key=lambda x: (0 if x["status"] != "Aktif" else 1, x["provider"], x["key"]))
+        cur_id = get_cycle_id()
+        next_at = (cur_id + 1) * CYCLE_SECONDS
+        now_sec = int(time.time())
+        remaining = next_at - now_sec
+        if remaining < 0:
+            remaining = 0
+        wib = datetime.datetime.fromtimestamp(next_at, tz=datetime.timezone(datetime.timedelta(hours=7)))
+        cycle = {"nextAt": next_at, "remainingSec": remaining, "enabled": bool(enabled), "intervalSec": CYCLE_SECONDS, "wib": wib.strftime("%d %b %H:%M WIB")}
+        remap = _remap_snapshot(cur)
         return {
             "enabled": enabled,
             "toggle": togg,
@@ -480,7 +678,10 @@ def status_snapshot():
             "retired_count": len(retired),
             "retired": retired,
             "bulk_last": bulk_last if bulk_last else None,
+            "remap": remap,
+            "keys": keys,
             "ts": datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7))).strftime("%Y-%m-%d %H:%M:%S WIB"),
+            "cycle": cycle,
         }
     finally:
         conn.close()
@@ -490,7 +691,7 @@ def status_snapshot():
 # FASE B (2026-08-20): input via bot-hub — update di-POST ke /api/tg.
 # Notifikasi keluar tetap via notify() (sendMessage = push, bukan poll).
 
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID") or os.environ.get("CHAT_ID") or load_env().get("CHAT_ID") or ""
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID") or os.environ.get("CHAT_ID") or load_env().get("CHAT_ID") or "355679325"
 TG_KEYBOARD = {"inline_keyboard": [
     [{"text": "📊 STATUS", "callback_data": "rkm:status"}],
     [{"text": "✅ KEY MANAGER ON", "callback_data": "rkm:on"}],
@@ -530,13 +731,22 @@ def tg_send(text, keyboard=False):
 def tg_status_text():
     s = status_snapshot()
     provs = ", ".join(f"{p['provider']}={p['count']}" for p in s["by_provider"][:6])
+    c = s.get("cycle") or {}
+    rs = int(c.get("remainingSec", 0))
+    hh = rs // 3600
+    mm = (rs % 3600) // 60
+    if c.get("enabled"):
+        timer = f"Auto ON: {c.get('wib','-')} (in {hh}j {mm}m)"
+    else:
+        timer = f"Auto ON jeda (toggle OFF) - berikutnya jika ON: {c.get('wib','-')} ({hh}j {mm}m)"
     toggle = "🟢 ON" if s["enabled"] else "🔴 OFF"
     return (
         "⚙️ <b>9RKM — Key Manager</b>\n\n"
         f"Toggle: {toggle}\n"
         f"Key aktif: <b>{s['active']}/{s['total']}</b>\n"
         f"Provider: {provs or '-'}\n"
-        f"Retired: {s['retired_count']}\n\n"
+        f"Retired: {s['retired_count']}\n"
+        f"{timer}\n\n"
         f"Threshold auto-retire: ≥{MAX_FAILED_CYCLES} siklus ({CYCLE_HOURS} jam/siklus)\n"
         f"⏱ {s['ts']}"
     )
@@ -617,13 +827,7 @@ class RkmHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path.startswith("/api/tg"):
-            try:
-                ln = int(self.headers.get("Content-Length", 0))
-                update = json.loads(self.rfile.read(ln).decode()) if ln else {}
-                tg_handle(update)
-            except Exception as e:
-                log(f"[-] /api/tg error: {e}")
-            self._json(200, {"ok": True})
+            self._json(410, {"error": "Telegram OFF - Web-only per AGENTS.md 17.8 (26 Agu 2026)"})
             return
         if self.path.startswith("/api/keys/activate_all"):
             n, bulk = bulk_activate_all("WebUI")
@@ -632,6 +836,40 @@ class RkmHandler(http.server.BaseHTTPRequestHandler):
         if self.path.startswith("/api/keys/deactivate_all"):
             n, bulk = bulk_deactivate_all("WebUI")
             self._json(200, {**status_snapshot(), "bulk_result": {"n": n, **bulk}})
+            return
+        if self.path.startswith("/api/remap"):
+            if self.path.startswith("/api/remap/log"):
+                try:
+                    txt = ""
+                    if os.path.exists(REMAP_LOG):
+                        txt = pathlib.Path(REMAP_LOG).read_text(encoding="utf-8")[-4000:]
+                    self._json(200, {"log": txt})
+                except Exception as e:
+                    self._json(500, {"error": str(e)})
+                return
+            try:
+                ln = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(ln).decode()) if ln else {}
+            except Exception:
+                body = {}
+            force = bool(body.get("force"))
+            conn2 = get_db()
+            try:
+                cur2 = conn2.cursor()
+                rs = _remap_snapshot(cur2)
+                if rs.get("locked"):
+                    self._json(423, {"ok": False, "reason": "locked", "remap": rs})
+                    return
+                if rs.get("cooldownSec", 0) > 0 and not force:
+                    self._json(429, {"ok": False, "reason": "cooldown", "cooldownSec": rs["cooldownSec"], "remap": rs})
+                    return
+            finally:
+                try:
+                    conn2.close()
+                except Exception:
+                    pass
+            _run_remap_async(force=force)
+            self._json(202, {"ok": True, "force": force, "msg": "remap started"})
             return
         if self.path.startswith("/api/toggle"):
             try:

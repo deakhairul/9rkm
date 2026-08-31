@@ -3,16 +3,16 @@
 aa_rank.py — sync 2 combo AA (Intelligence + Agentic) + Vision dari Data API v2/free
 Scope: Artificial-Analysis-Intelligence-Index & Artificial-Analysis-Agentic-Index + Vision-Adapter
 Source: https://artificialanalysis.ai/api/v2/language/models/free (x-api-key)
-Aturan: exclude no-score, dedup 1 model/provider (prefix), pure AA (-score tie free), beda len Intel/Agentic tanpa samakan
-Jadwal: fetch 1x/hari 08:00 WIB tulis aa_cache.json (1 hit API), remap per 5 jam baca cache (0 hit API), manual POST /api/remap trigger async
-  - Jika fetch gagal 429/limit/tier habis -> fallback baca aa_cache.json / kv aa_cache (DB fallback)
-  KR: kr/claude-sonnet-4.5 -> Claude Sonnet 4.5 exact, orcarouter/free -> DeepSeek V4 Pro 0813 Max, occ rate=pass, ocgc/nvidia pass
+Aturan: discover katalog 9Router, rank semua kandidat per provider, probe terbaik turun sampai 2xx, satu model/provider
+Jadwal: setiap siklus 5 jam fetch skor AA + katalog provider; cache AA hanya fallback saat fetch gagal
 """
-import json, sys, os, sqlite3, time, datetime, urllib.request, urllib.error, pathlib, subprocess, concurrent.futures, hashlib, time
+import json, sys, os, sqlite3, time, datetime, urllib.request, urllib.error, pathlib, subprocess, concurrent.futures, hashlib, re, threading
 
 DB = os.environ.get("ROUTER_DB", os.path.expanduser("~/.9router/db/data.sqlite"))
 ALIAS_PATH = os.path.join(os.path.dirname(__file__), "aa_alias.json")
 ROUTER_API = os.environ.get("ROUTER_API", "http://localhost:20128/v1/chat/completions")
+ROUTER_MODELS_API = os.environ.get("ROUTER_MODELS_API", ROUTER_API.rsplit("/chat/completions", 1)[0] + "/models")
+OPENROUTER_MODELS_API = os.environ.get("AA_OPENROUTER_MODELS_API", "https://openrouter.ai/api/v1/models")
 PROBE_TIMEOUT = int(os.environ.get("AA_PROBE_TIMEOUT", "25"))
 PROBE_WORKERS = int(os.environ.get("AA_PROBE_WORKERS", "8"))
 KEY_ENV = "AA_API_KEY"
@@ -136,7 +136,7 @@ def fetch_api_all():
                     break
                 page += 1
                 if page > 10:
-                    break
+                    raise RuntimeError("AA pagination incomplete after 10 pages")
         except urllib.error.HTTPError as e:
             body = ""
             try:
@@ -152,13 +152,146 @@ def fetch_api_all():
     return rows, intel_ver, tier_last, rem_last
 
 def is_free(mid: str) -> bool:
-    return "free" in (mid or "").lower()
+    value = (mid or "").lower()
+    suffix = value.split("/", 1)[1] if "/" in value else value
+    return suffix.endswith(":free") or suffix.endswith("-free") or "free" in suffix.split("/")
+
+def model_is_free(model):
+    pricing = model.get("pricing") if isinstance(model, dict) else None
+    if isinstance(pricing, dict):
+        try:
+            if float(pricing.get("prompt", 1)) == 0 and float(pricing.get("completion", 1)) == 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+    return is_free(str(model.get("id") or ""))
 
 def load_alias():
     p = pathlib.Path(ALIAS_PATH)
     if not p.exists():
         return {}
     return json.loads(p.read_text(encoding="utf-8"))
+
+def normalize_model_id(value):
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", (value or "").lower())).strip("-")
+
+def aa_indexes(rows):
+    by_name = {}
+    by_slug = {}
+    ambiguous = set()
+    for row in rows or []:
+        name = (row.get("name") or "").strip()
+        slug = normalize_model_id(row.get("slug") or "")
+        if name:
+            by_name[name] = row
+        if slug:
+            if slug in by_slug and by_slug[slug].get("id") != row.get("id"):
+                ambiguous.add(slug)
+            else:
+                by_slug[slug] = row
+    for slug in ambiguous:
+        by_slug.pop(slug, None)
+    return by_name, by_slug
+
+def route_identity_candidates(mid):
+    suffix = mid.split("/", 1)[1] if "/" in mid else mid
+    last = suffix.rsplit("/", 1)[-1]
+    out = []
+    for value in (suffix, last):
+        candidate = normalize_model_id(value)
+        for item in (candidate, re.sub(r"-(?:free|promo|alibaba)$", "", candidate)):
+            if item and item not in out:
+                out.append(item)
+    return out
+
+def resolve_aa_row(mid, aliases, by_name, by_slug):
+    label = aliases.get(mid)
+    if label and label in by_name:
+        return by_name[label]
+    for candidate in route_identity_candidates(mid):
+        if candidate in by_slug:
+            return by_slug[candidate]
+    return None
+
+def build_ranked_candidates(catalog, aliases, rows, target_key, fallback_key, active_prefixes=None):
+    by_name, by_slug = aa_indexes(rows)
+    groups = {}
+    unmatched = 0
+    for model in catalog:
+        mid = str(model.get("id") or "")
+        if "/" not in mid or str(model.get("owned_by") or "").lower() == "combo":
+            continue
+        provider = mid.split("/", 1)[0].lower()
+        if active_prefixes is not None and provider not in active_prefixes:
+            continue
+        row = resolve_aa_row(mid, aliases, by_name, by_slug)
+        if not row:
+            unmatched += 1
+            continue
+        evaluations = row.get("evaluations") or {}
+        primary = evaluations.get(target_key)
+        fallback = evaluations.get(fallback_key)
+        if not isinstance(primary, (int, float)) and not isinstance(fallback, (int, float)):
+            continue
+        score = float(primary if isinstance(primary, (int, float)) else fallback)
+        candidate = {
+            "mid": mid,
+            "label": row.get("name") or mid,
+            "score": score,
+            "primary": isinstance(primary, (int, float)),
+            "free": model_is_free(model),
+        }
+        candidate["sort_key"] = (0 if candidate["primary"] else 1, -score, 0 if candidate["free"] else 1, mid)
+        candidate["order_key"] = (-score, 0 if candidate["free"] else 1, mid)
+        groups.setdefault(provider, []).append(candidate)
+    for candidates in groups.values():
+        candidates.sort(key=lambda item: item["sort_key"])
+    return groups, unmatched
+
+def validate_selection(selected, probe_cache):
+    if not selected:
+        return False
+    providers = [item["mid"].split("/", 1)[0].lower() for item in selected]
+    return len(providers) == len(set(providers)) and all(probe_cache.get(item["mid"]) == "ok" for item in selected)
+
+def select_working_candidates(groups, probe, probe_cache=None, workers=None, paid_unavailable=None):
+    cache = probe_cache if probe_cache is not None else {}
+    paid_unavailable = paid_unavailable if paid_unavailable is not None else set()
+    paid_lock = threading.Lock()
+    workers = workers or PROBE_WORKERS
+    def choose(item):
+        provider, candidates = item
+        attempts = []
+        for candidate in candidates:
+            with paid_lock:
+                skip_paid = provider in paid_unavailable and not candidate["free"]
+            if skip_paid:
+                continue
+            mid = candidate["mid"]
+            status = cache.get(mid)
+            if status is None:
+                status = probe(mid)
+                cache[mid] = status
+            attempts.append((mid, status))
+            if status == "ok":
+                return provider, candidate, attempts
+            if status == "payment":
+                with paid_lock:
+                    paid_unavailable.add(provider)
+        return provider, None, attempts
+    selected = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, len(groups) or 1))) as executor:
+        futures = [executor.submit(choose, item) for item in sorted(groups.items())]
+        for future in concurrent.futures.as_completed(futures):
+            provider, candidate, attempts = future.result()
+            for mid, status in attempts:
+                log(f"[aa_rank] candidate {status:5} {provider:12} {mid}")
+            if candidate:
+                selected.append(candidate)
+            else:
+                log(f"[aa_rank] EXCLUDE provider {provider}: no candidate returned 2xx")
+    selected.sort(key=lambda item: item["order_key"])
+    return selected
 
 def distinct_models(conn):
     cur = conn.cursor()
@@ -188,6 +321,85 @@ def dedup_by_provider(scored):
     out.sort(key=key_fn)
     return out
 
+PREFIX_PROVIDER_MAP = {
+    "ag": ["gemini", "antigravity"],
+    "gemini": ["gemini"],
+    "gc": ["gemini-cli"],
+    "vx": ["vertex"],
+    "cc": ["claude"],
+    "cx": ["codex"],
+    "kc": ["kilocode"],
+    "nvidia": ["nvidia"],
+    "cerebras": ["cerebras"],
+    "groq": ["groq"],
+    "mistral": ["mistral"],
+    "ollama": ["ollama"],
+    "cf": ["cloudflare-ai"],
+    "tokenrouter": ["tokenrouter"],
+    "openrouter": ["openrouter"],
+    "bynara": ["openai-compatible-chat-ca41cb40-b185-42e9-a648-5f5937f96f69"],
+    "occ": ["openai-compatible-chat-88eeba84-c728-4d9f-aeed-f2c90ff53926"],
+    "ocgc": ["openai-compatible-chat-e880bc91-fb90-4526-aeda-4f4816d938cd"],
+    "madewgn": ["openai-compatible-chat-702fb81f-b075-4abf-82c4-c30d31087da5"],
+    "orcarouter": ["openai-compatible-chat-5da092d7-90ce-48db-b765-301f2bb59ce5", "deepseek"],
+    "kr": ["kiro"],
+    "zenmux": ["openai-compatible-chat-766044ec-1137-4f87-ad22-42ccc998d898"],
+    "ocgcc": ["openai-compatible-chat-e880bc91-fb90-4526-aeda-4f4816d938cd"],
+    "ocgcr": ["openai-compatible-responses-b66965b1-8f0b-4915-bad6-6f2afd60de51"],
+    "qwen": ["openai-compatible-chat-75bfd34f-a67c-4311-96b1-a7d1f238ccbe"],
+    "oc": ["antigravity"],
+    "ocg": ["opencode-go"],
+    "ocr": ["openai-compatible-responses-59d9ff3d-ceb8-4958-a5f9-da2a7e0a3a2e"],
+}
+
+def connection_inventory(conn):
+    inventory = {}
+    rows = conn.execute("SELECT provider, data FROM providerConnections WHERE isActive=1").fetchall()
+    for provider, raw in rows:
+        try:
+            data = json.loads(raw) if raw else {}
+        except Exception:
+            data = {}
+        provider_id = (provider or "").lower()
+        specific = data.get("providerSpecificData") if isinstance(data, dict) else None
+        specific_prefix = (specific.get("prefix") or "").strip().lower() if isinstance(specific, dict) else ""
+        routes = {provider_id, specific_prefix} - {""}
+        for route_prefix, provider_ids in PREFIX_PROVIDER_MAP.items():
+            if provider_id in provider_ids or specific_prefix in provider_ids:
+                routes.add(route_prefix)
+        for route in routes:
+            inventory.setdefault(route, []).append(data)
+    return inventory
+
+def model_lock_active(connection, model, now=None):
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    for key in (f"modelLock_{model}", "modelLock___all"):
+        value = connection.get(key)
+        if not value:
+            continue
+        try:
+            if datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00")) > now:
+                return True
+        except Exception:
+            continue
+    return False
+
+def filter_catalog_by_locks(catalog, inventory):
+    kept = []
+    skipped = 0
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for model in catalog:
+        mid = str(model.get("id") or "")
+        if "/" not in mid:
+            continue
+        prefix, suffix = mid.split("/", 1)
+        connections = inventory.get(prefix.lower(), [])
+        if connections and all(model_lock_active(connection, suffix, now) for connection in connections):
+            skipped += 1
+            continue
+        kept.append(model)
+    return kept, skipped
+
 def has_active_connection(conn, prefix):
     p = (prefix or "").lower()
     cur = conn.cursor()
@@ -209,36 +421,7 @@ def has_active_connection(conn, prefix):
         return True
     if p in active_providers:
         return True
-    mapping = {
-        "ag": ["gemini", "antigravity"],
-        "gemini": ["gemini"],
-        "gc": ["gemini-cli"],
-        "vx": ["vertex"],
-        "cc": ["claude"],
-        "cx": ["codex"],
-        "kc": ["kilocode"],
-        "nvidia": ["nvidia"],
-        "cerebras": ["cerebras"],
-        "groq": ["groq"],
-        "mistral": ["mistral"],
-        "ollama": ["ollama"],
-        "cf": ["cloudflare-ai"],
-        "tokenrouter": ["tokenrouter"],
-        "openrouter": ["openrouter"],
-        "bynara": ["openai-compatible-chat-ca41cb40-b185-42e9-a648-5f5937f96f69"],
-        "occ": ["openai-compatible-chat-88eeba84-c728-4d9f-aeed-f2c90ff53926"],
-        "ocgc": ["openai-compatible-chat-e880bc91-fb90-4526-aeda-4f4816d938cd"],
-        "madewgn": ["openai-compatible-chat-702fb81f-b075-4abf-82c4-c30d31087da5"],
-        "orcarouter": ["openai-compatible-chat-5da092d7-90ce-48db-b765-301f2bb59ce5", "deepseek"],
-        "kr": ["kiro"],
-        "zenmux": ["openai-compatible-chat-766044ec-1137-4f87-ad22-42ccc998d898"],
-        "ocgcc": ["openai-compatible-chat-e880bc91-fb90-4526-aeda-4f4816d938cd"],
-        "ocgcr": ["openai-compatible-responses-b66965b1-8f0b-4915-bad6-6f2afd60de51"],
-        "qwen": ["openai-compatible-chat-75bfd34f-a67c-4311-96b1-a7d1f238ccbe"],
-        "oc": ["antigravity"],
-        "ocr": ["openai-compatible-responses-59d9ff3d-ceb8-4958-a5f9-da2a7e0a3a2e"],
-    }
-    for cand in mapping.get(p, []):
+    for cand in PREFIX_PROVIDER_MAP.get(p, []):
         if cand.lower() in active_providers or cand.lower() in active_prefixes:
             return True
     return False
@@ -378,7 +561,6 @@ def write_vision_adapter(conn, pool):
     pool_ids = [mid for mid, _, _ in pool]
     data["capacityAdapter"]["vision"] = {"enabled": True, "roundRobin": True, "models": pool_ids}
     conn.execute("UPDATE settings SET data=? WHERE id=1", (json.dumps(data),))
-    conn.commit()
     log(f"[aa_rank] wrote capacityAdapter.vision {len(pool_ids)} models")
     for mid, label, score in pool:
         tag = "free" if is_free(mid) else "paid"
@@ -402,6 +584,34 @@ def router_key_via_db(conn):
     except Exception:
         pass
     return os.environ.get("ROUTER_KEY","")
+
+def fetch_router_catalog(conn):
+    api_key = router_key_via_db(conn)
+    if not api_key:
+        raise RuntimeError("9Router API key unavailable")
+    req = urllib.request.Request(ROUTER_MODELS_API, headers={"Authorization": f"Bearer {api_key}", "User-Agent": "9rkm-aa_rank/2.0"})
+    with urllib.request.urlopen(req, timeout=PROBE_TIMEOUT) as response:
+        body = json.loads(response.read().decode())
+    models = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(models, list) or not models:
+        raise RuntimeError("9Router catalog empty or malformed")
+    catalog = [model for model in models if isinstance(model, dict) and "/" in str(model.get("id") or "") and str(model.get("owned_by") or "").lower() != "combo"]
+    if not catalog:
+        raise RuntimeError("9Router catalog has no provider routes")
+    if has_active_connection(conn, "openrouter"):
+        request = urllib.request.Request(OPENROUTER_MODELS_API, headers={"User-Agent": "9rkm-aa_rank/2.0"})
+        with urllib.request.urlopen(request, timeout=PROBE_TIMEOUT) as response:
+            upstream = json.loads(response.read().decode()).get("data")
+        if not isinstance(upstream, list) or not upstream:
+            raise RuntimeError("OpenRouter catalog empty or malformed")
+        catalog = [model for model in catalog if str(model.get("id") or "").split("/", 1)[0].lower() != "openrouter"]
+        catalog.extend({**model, "id": f"openrouter/{model['id']}", "owned_by": "openrouter"} for model in upstream if isinstance(model, dict) and model.get("id"))
+    return catalog
+
+def active_route_prefixes(conn, catalog, inventory=None):
+    inventory = inventory or connection_inventory(conn)
+    prefixes = {str(model.get("id")).split("/", 1)[0].lower() for model in catalog}
+    return prefixes & set(inventory)
 
 PROBE_MAX_TOKENS = (16, 64)
 PROBE_RETRY_SLEEP = int(os.environ.get("AA_PROBE_RETRY_SLEEP", "30"))
@@ -435,40 +645,22 @@ def _is_model_rejected(body):
 def probe_model(mid, api_key, timeout=PROBE_TIMEOUT):
     if not api_key:
         return "fail"
-    for max_tok in PROBE_MAX_TOKENS:
-        payload = json.dumps({"model": mid, "messages": [{"role": "user", "content": "ping"}], "max_tokens": max_tok, "stream": False})
+    payload = json.dumps({"model": mid, "messages": [{"role": "user", "content": "Reply PONG only"}], "max_tokens": PROBE_MAX_TOKENS[-1], "stream": False})
+    try:
+        req = urllib.request.Request(ROUTER_API, data=payload.encode(), headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            response.read()
+            return "ok" if 200 <= response.status < 300 else "down"
+    except urllib.error.HTTPError as error:
         try:
-            req = urllib.request.Request(ROUTER_API, data=payload.encode(), headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                d = json.loads(r.read().decode())
-                msg = d.get("choices", [{}])[0].get("message", {})
-                return "ok" if isinstance(msg, dict) else "down"
-        except urllib.error.HTTPError as e:
-            try:
-                body = e.read().decode("utf-8","replace")
-            except Exception:
-                body = str(e)
-            if "max_output_tokens" in body or "max_tokens" in body.lower():
-                time.sleep(PROBE_RETRY_SLEEP)
-                continue
-            if _is_payment_rejected(body):
-                return "down"
-            if "429" in str(e) or "rate_limit" in body or "FreeUsageLimit" in body:
-                return "rate"
-            if "No active credentials" in body or "model_not_found" in body:
-                return "down"
-            if _is_model_rejected(body):
-                return "down"
-            if max_tok == PROBE_MAX_TOKENS[-1]:
-                return "fail"
-            time.sleep(PROBE_RETRY_SLEEP)
-            continue
+            body = error.read().decode("utf-8", "replace")
         except Exception:
-            if max_tok == PROBE_MAX_TOKENS[-1]:
-                return "fail"
-            time.sleep(PROBE_RETRY_SLEEP)
-            continue
-    return "fail"
+            body = str(error)
+        if error.code == 402 or _is_payment_rejected(body):
+            return "payment"
+        return "rate" if error.code == 429 else "down"
+    except Exception:
+        return "fail"
 
 _CATALOG_CACHE = {}
 
@@ -563,8 +755,16 @@ def _open_conn():
     p = DB if os.path.exists(DB) else os.path.expanduser("~/.9router/db/data.sqlite")
     return sqlite3.connect(p), p
 
+def prune_backups(db_path, keep=10):
+    patterns = (f"{pathlib.Path(db_path).name}.bak-aa-*", f"{pathlib.Path(db_path).name}.combo-rollback-*.json")
+    parent = pathlib.Path(db_path).parent
+    for pattern in patterns:
+        files = sorted(parent.glob(pattern), key=lambda path: path.stat().st_mtime, reverse=True)
+        for path in files[keep:]:
+            path.unlink()
+
 def do_fetch():
-    log(f"[aa_rank] FETCH 1x/hari cache={CACHE_PATH}")
+    log(f"[aa_rank] FETCH cache={CACHE_PATH}")
     try:
         rows, ver, tier, rem = fetch_api_all()
         save_cache(rows, ver, tier, rem)
@@ -587,96 +787,89 @@ def do_fetch():
         log(f"[aa_rank] fetch fail {e}", file=sys.stderr)
         return 2
 
-def do_remap(write=True, with_vision=True, dry=False, use_cache=True):
-    # LOCK: cegah concurrent dengan Web POST / cron
-    lock_path = "/tmp/9rkm-remap.lock"
-    try:
-        if os.environ.get("AA_REMAP_LOCK_HELD") != "1" and os.path.exists(lock_path) and (time.time() - os.path.getmtime(lock_path) < 300):
-            log(f"[aa_rank] SKIP remap locked age={(time.time() - os.path.getmtime(lock_path)):.0f}s")
-            return 5
-    except Exception:
-        pass
+def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
     alias = load_alias()
-    log(f"[aa_rank] REMAP alias {len(alias)} cache={use_cache} write={write} with_vision={with_vision} dry={dry}")
-    rows = None
-    ver = None
-    source = "api"
-    if use_cache:
+    log(f"[aa_rank] REMAP alias {len(alias)} cache_fallback={use_cache} write={write} with_vision={with_vision} dry={dry}")
+    try:
+        rows, ver, tier, rem = fetch_api_all()
+        source = "api"
+        if not dry:
+            save_cache(rows, ver, tier, rem)
+        log(f"[aa_rank] remap source=api n={len(rows)} ver={ver}{' (dry, cache unchanged)' if dry else ' (cache refreshed)'}")
+    except Exception as error:
+        if not use_cache:
+            log(f"[aa_rank] AA fetch failed and cache disabled: {error}", file=sys.stderr)
+            return 3
         rows, ver = load_cache()
-        if rows:
-            source = "cache"
-            log(f"[aa_rank] remap source=cache n={len(rows)} ver={ver}")
-    if rows is None:
-        try:
-            rows, ver, _, _ = fetch_api_all()
-            source = "api"
-            save_cache(rows, ver)
-            log(f"[aa_rank] remap source=api n={len(rows)} ver={ver} (cache refreshed)")
-        except RuntimeError as e:
-            low = str(e).lower()
-            if "429" in str(e) or "rate" in low or "limit" in low:
-                log(f"[aa_rank] remap API 429 -> fallback DB cache")
-                rows, ver = load_cache()
-                if rows:
-                    source = "cache-fallback"
-                    log(f"[aa_rank] fallback cache n={len(rows)} ver={ver}")
-                else:
-                    log("[aa_rank] no cache fallback -> abort", file=sys.stderr)
-                    return 3
-            else:
-                raise
-    by_name = {}
+        if not rows:
+            log(f"[aa_rank] AA fetch failed and no cache: {error}", file=sys.stderr)
+            return 3
+        source = "cache-fallback"
+        log(f"[aa_rank] AA fetch failed -> cache n={len(rows)} ver={ver}: {error}")
+    by_name, _ = aa_indexes(rows)
     intel_map = {}
     agentic_map = {}
-    for r in rows or []:
-        name = (r.get("name") or "").strip()
-        ev = r.get("evaluations") or {}
-        intel = ev.get("artificial_analysis_intelligence_index")
-        agentic = ev.get("artificial_analysis_agentic_index")
-        if name:
-            by_name[name] = r
-            if isinstance(intel, (int, float)):
-                intel_map[name] = float(intel)
-            if isinstance(agentic, (int, float)):
-                agentic_map[name] = float(agentic)
+    for name, row in by_name.items():
+        evaluations = row.get("evaluations") or {}
+        intel = evaluations.get("artificial_analysis_intelligence_index")
+        agentic = evaluations.get("artificial_analysis_agentic_index")
+        if isinstance(intel, (int, float)):
+            intel_map[name] = float(intel)
+        if isinstance(agentic, (int, float)):
+            agentic_map[name] = float(agentic)
     log(f"[aa_rank] intel_map {len(intel_map)} agentic_map {len(agentic_map)} source={source}")
     conn, db_path = _open_conn()
-    distinct = distinct_models(conn)
-    log(f"[aa_rank] distinct models {len(distinct)}")
-    for m in distinct:
-        log(f"  - {m} -> {alias.get(m, '?')}")
-    def build_scored(score_map, fallback_map=None):
-        scored = []
-        for mid in distinct:
-            label = alias.get(mid)
-            score = score_map.get(label) if label and isinstance(score_map.get(label), (int, float)) else None
-            if not isinstance(score, (int, float)):
-                if fallback_map is not None and label and isinstance(fallback_map.get(label), (int, float)):
-                    score = float(fallback_map[label])
-                else:
-                    continue
-            scored.append((mid, label, float(score)))
-        return scored
-    intel_scored = build_scored(intel_map, agentic_map)
-    agentic_scored = build_scored(agentic_map, intel_map)
-    log(f"[aa_rank] scored Intel {len(intel_scored)} Agentic {len(agentic_scored)} (before probe)")
-    intel_probed = filter_active_and_probe(conn, intel_scored)
-    agentic_probed = filter_active_and_probe(conn, agentic_scored)
-    log(f"[aa_rank] probed Intel {len(intel_probed)} Agentic {len(agentic_probed)} (pass=[ok,rate])")
-    intel_sorted = dedup_by_provider(intel_probed)
-    agentic_sorted = dedup_by_provider(agentic_probed)
-    log(f"[aa_rank] dedup Intel {len(intel_sorted)} Agentic {len(agentic_sorted)} (keep max score among pass)")
-    intel_list = [mid for mid, _, _ in intel_sorted]
-    agentic_list = [mid for mid, _, _ in agentic_sorted]
-    log(f"[aa_rank] final Intel {len(intel_list)} Agentic {len(agentic_list)} (union fallback MAX, pure AA -score tie free)")
-    log("\n[aa_rank] Intelligence sorted (pure AA -score tie free, 1/provider):")
-    for mid, label, score in intel_sorted:
-        tag = "free" if is_free(mid) else "paid"
-        log(f"  {score:6.1f} [{tag:4}] {mid:45} <- {label}")
-    log("\n[aa_rank] Agentic sorted (pure AA -score tie free, 1/provider):")
-    for mid, label, score in agentic_sorted:
-        tag = "free" if is_free(mid) else "paid"
-        log(f"  {score:6.1f} [{tag:4}] {mid:45} <- {label}")
+    try:
+        catalog = fetch_router_catalog(conn)
+    except Exception as error:
+        log(f"[aa_rank] catalog discovery failed -> no write: {error}", file=sys.stderr)
+        conn.close()
+        return 4
+    inventory = connection_inventory(conn)
+    active_prefixes = active_route_prefixes(conn, catalog, inventory)
+    if not active_prefixes:
+        log("[aa_rank] no active provider prefixes -> no write", file=sys.stderr)
+        conn.close()
+        return 4
+    catalog, locked_skipped = filter_catalog_by_locks(catalog, inventory)
+    intel_groups, intel_unmatched = build_ranked_candidates(
+        catalog, alias, rows,
+        "artificial_analysis_intelligence_index",
+        "artificial_analysis_agentic_index",
+        active_prefixes,
+    )
+    agentic_groups, agentic_unmatched = build_ranked_candidates(
+        catalog, alias, rows,
+        "artificial_analysis_agentic_index",
+        "artificial_analysis_intelligence_index",
+        active_prefixes,
+    )
+    log(f"[aa_rank] catalog {len(catalog)} active_prefixes {len(active_prefixes)} locked_skip {locked_skipped} candidates Intel {sum(map(len, intel_groups.values()))}/{len(intel_groups)} Agentic {sum(map(len, agentic_groups.values()))}/{len(agentic_groups)} unmatched {max(intel_unmatched, agentic_unmatched)}")
+    api_key = router_key_via_db(conn)
+    if not api_key:
+        log("[aa_rank] no router API key -> no write", file=sys.stderr)
+        conn.close()
+        return 4
+    probe_cache = {}
+    paid_unavailable = set()
+    probe = lambda mid: probe_model(mid, api_key)
+    intel_selected = select_working_candidates(intel_groups, probe, probe_cache, paid_unavailable=paid_unavailable)
+    agentic_selected = select_working_candidates(agentic_groups, probe, probe_cache, paid_unavailable=paid_unavailable)
+    intel_sorted = [(item["mid"], item["label"], item["score"]) for item in intel_selected]
+    agentic_sorted = [(item["mid"], item["label"], item["score"]) for item in agentic_selected]
+    intel_list = [item["mid"] for item in intel_selected]
+    agentic_list = [item["mid"] for item in agentic_selected]
+    log(f"[aa_rank] final Intel {len(intel_list)} Agentic {len(agentic_list)} probes {len(probe_cache)} (best active per provider)")
+    log("\n[aa_rank] Intelligence sorted (target index, other index fallback):")
+    for item in intel_selected:
+        tag = "free" if item["free"] else "paid"
+        fallback = "" if item["primary"] else " fallback-index"
+        log(f"  {item['score']:6.1f} [{tag:4}] {item['mid']:45} <- {item['label']}{fallback}")
+    log("\n[aa_rank] Agentic sorted (target index, other index fallback):")
+    for item in agentic_selected:
+        tag = "free" if item["free"] else "paid"
+        fallback = "" if item["primary"] else " fallback-index"
+        log(f"  {item['score']:6.1f} [{tag:4}] {item['mid']:45} <- {item['label']}{fallback}")
     vision_pool = None
     if with_vision:
         try:
@@ -696,36 +889,32 @@ def do_remap(write=True, with_vision=True, dry=False, use_cache=True):
         log("\n[aa_rank] nothing to write (use --dry or --write)")
         conn.close()
         return 0
-    import shutil, hashlib as _hl
+    if not validate_selection(intel_selected, probe_cache) or not validate_selection(agentic_selected, probe_cache):
+        log("[aa_rank] ABORT invalid selection; keep DB", file=sys.stderr)
+        conn.close()
+        return 4
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     bak = db_path + f".bak-aa-{ts}"
     try:
-        shutil.copy2(db_path, bak)
-        md5 = _hl.md5(open(bak, "rb").read()).hexdigest()[:8]
-        log(f"[aa_rank] backup {bak} md5 {md5}")
+        backup_conn = sqlite3.connect(bak + ".tmp")
+        conn.backup(backup_conn)
+        integrity = backup_conn.execute("PRAGMA integrity_check").fetchone()[0]
+        backup_conn.close()
+        if integrity != "ok":
+            raise RuntimeError(f"backup integrity {integrity}")
+        os.chmod(bak + ".tmp", 0o600)
+        os.replace(bak + ".tmp", bak)
+        digest = hashlib.sha256()
+        with open(bak, "rb") as backup_file:
+            for chunk in iter(lambda: backup_file.read(1024 * 1024), b""):
+                digest.update(chunk)
+        log(f"[aa_rank] backup {bak} sha256 {digest.hexdigest()[:12]}")
     except Exception as e:
         log(f"[aa_rank] backup fail {e}", file=sys.stderr)
         conn.close()
-        sys.exit(2)
+        return 2
     cur = conn.cursor()
-    # GUARD: jangan tulis combo kosong — pakai DB lama (fallback database)
-    prev_intel = None
-    prev_agentic = None
     prev_vision = None
-    try:
-        cur.execute("SELECT models FROM combos WHERE name=?", (COMBO_INTEL,))
-        r = cur.fetchone()
-        if r and r[0]:
-            prev_intel = json.loads(r[0])
-    except Exception:
-        pass
-    try:
-        cur.execute("SELECT models FROM combos WHERE name=?", (COMBO_AGENTIC,))
-        r = cur.fetchone()
-        if r and r[0]:
-            prev_agentic = json.loads(r[0])
-    except Exception:
-        pass
     try:
         row = conn.execute("SELECT data FROM settings WHERE id=1").fetchone()
         if row and row[0]:
@@ -733,42 +922,38 @@ def do_remap(write=True, with_vision=True, dry=False, use_cache=True):
             prev_vision = d.get("capacityAdapter", {}).get("vision", {}).get("models")
     except Exception:
         pass
-    if not intel_list:
-        log(f"[aa_rank] GUARD skip write {COMBO_INTEL} empty -> keep DB {len(prev_intel) if prev_intel else 0}")
-        if prev_intel is not None:
-            intel_list = prev_intel
-            intel_sorted = [(m, alias.get(m, m), 0) for m in intel_list]  # placeholder for logging
-        else:
-            log(f"[aa_rank] ABORT Intel empty and no prev -> no write", file=sys.stderr)
-    if not agentic_list:
-        log(f"[aa_rank] GUARD skip write {COMBO_AGENTIC} empty -> keep DB {len(prev_agentic) if prev_agentic else 0}")
-        if prev_agentic is not None:
-            agentic_list = prev_agentic
-            agentic_sorted = [(m, alias.get(m, m), 0) for m in agentic_list]
-        else:
-            log(f"[aa_rank] ABORT Agentic empty and no prev -> no write", file=sys.stderr)
-    # hanya tulis jika ada isinya
-    for name, lst in [(COMBO_INTEL, intel_list), (COMBO_AGENTIC, agentic_list)]:
-        if not lst:
-            log(f"[aa_rank] SKIP write {name} empty")
-            continue
-        cur.execute("UPDATE combos SET models = ? WHERE name = ?", (json.dumps(lst), name))
-        if cur.rowcount == 0:
-            cur.execute("INSERT INTO combos(name, models) VALUES(?, ?)", (name, json.dumps(lst)))
-        log(f"[aa_rank] wrote {name} {len(lst)} models")
-    if vision_pool is not None:
-        if len(vision_pool) == 0:
-            log(f"[aa_rank] GUARD skip write vision empty -> keep DB {len(prev_vision) if prev_vision else 0}")
-        else:
-            write_vision_adapter(conn, vision_pool)
-    else:
-        log(f"[aa_rank] vision_pool None -> skip")
+    rollback_path = db_path + f".combo-rollback-{ts}.json"
+    previous_rows = {}
+    for combo_name in (COMBO_INTEL, COMBO_AGENTIC):
+        row = cur.execute("SELECT models FROM combos WHERE name=?", (combo_name,)).fetchone()
+        previous_rows[combo_name] = json.loads(row[0]) if row and row[0] else None
+    pathlib.Path(rollback_path).write_text(json.dumps(previous_rows, indent=2), encoding="utf-8")
+    os.chmod(rollback_path, 0o600)
+    log(f"[aa_rank] combo rollback {rollback_path}")
     try:
-        remap_state = {"at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00","Z"), "source": source, "intel": len(intel_list), "agentic": len(agentic_list), "vision": len(vision_pool) if vision_pool else 0}
+        cur.execute("BEGIN IMMEDIATE")
+        expected = {COMBO_INTEL: intel_list, COMBO_AGENTIC: agentic_list}
+        for name, lst in expected.items():
+            cur.execute("UPDATE combos SET models = ? WHERE name = ?", (json.dumps(lst), name))
+            if cur.rowcount == 0:
+                cur.execute("INSERT INTO combos(name, models) VALUES(?, ?)", (name, json.dumps(lst)))
+            log(f"[aa_rank] wrote {name} {len(lst)} models")
+        if vision_pool:
+            write_vision_adapter(conn, vision_pool)
+        else:
+            log("[aa_rank] vision unchanged")
+        remap_state = {"at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00","Z"), "source": source, "intel": len(intel_list), "agentic": len(agentic_list), "vision": len(vision_pool) if vision_pool else 0, "backup": bak, "rollback": rollback_path}
         cur.execute("INSERT INTO kv(scope,key,value) VALUES(?,?,?) ON CONFLICT(scope,key) DO UPDATE SET value=excluded.value", (KV_REMAP_SCOPE, KV_REMAP_KEY, json.dumps(remap_state)))
-    except Exception as e:
-        log(f"[aa_rank] remap kv fail {e}")
-    conn.commit()
+        for name, lst in expected.items():
+            row = cur.execute("SELECT models FROM combos WHERE name=?", (name,)).fetchone()
+            if not row or json.loads(row[0]) != lst:
+                raise RuntimeError(f"exact verification failed {name}")
+        conn.commit()
+    except Exception as error:
+        conn.rollback()
+        log(f"[aa_rank] transaction rollback: {error}", file=sys.stderr)
+        conn.close()
+        return 4
     cur.execute("SELECT name, json_array_length(models) FROM combos WHERE name IN (?,?)", (COMBO_INTEL, COMBO_AGENTIC))
     for row in cur.fetchall():
         log(f"[aa_rank] verify {row[0]} len={row[1]}")
@@ -786,8 +971,35 @@ def do_remap(write=True, with_vision=True, dry=False, use_cache=True):
     except Exception:
         pass
     conn.close()
+    prune_backups(db_path)
     log(f"[aa_rank] done source={source}")
     return 0
+
+def do_remap(write=True, with_vision=True, dry=False, use_cache=True):
+    lock_path = "/tmp/9rkm-remap.lock"
+    if os.environ.get("AA_REMAP_LOCK_HELD") == "1":
+        return _do_remap_unlocked(write, with_vision, dry, use_cache)
+    try:
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(descriptor, str(os.getpid()).encode())
+        os.close(descriptor)
+    except FileExistsError:
+        try:
+            age = time.time() - os.path.getmtime(lock_path)
+            if age >= 1800:
+                os.remove(lock_path)
+                return do_remap(write, with_vision, dry, use_cache)
+            log(f"[aa_rank] SKIP remap locked age={age:.0f}s")
+        except Exception:
+            log("[aa_rank] SKIP remap locked")
+        return 5
+    try:
+        return _do_remap_unlocked(write, with_vision, dry, use_cache)
+    finally:
+        try:
+            os.remove(lock_path)
+        except FileNotFoundError:
+            pass
 
 def main():
     if "--fetch" in sys.argv:
@@ -796,16 +1008,13 @@ def main():
         use_cache = "--no-cache" not in sys.argv
         dry = "--dry" in sys.argv
         write = "--write" in sys.argv or "--cron" in sys.argv or not dry
-        with_vision = True
+        with_vision = "--vision" in sys.argv
         if "--no-vision" in sys.argv:
             with_vision = False
-        if "--vision" in sys.argv:
-            with_vision = True
         if "--cron" in sys.argv:
             dry = False
             write = True
             use_cache = True
-        # --cron = remap via cache (0 hit API), --fetch = 1x/hari hit API
         sys.exit(do_remap(write=write, with_vision=with_vision, dry=dry, use_cache=use_cache))
     dry = "--dry" in sys.argv
     write = "--write" in sys.argv
@@ -813,7 +1022,7 @@ def main():
     vision_only = "--vision" in sys.argv and "--with-vision" not in sys.argv and "--remap" not in sys.argv
     vision_with_combos = "--with-vision" in sys.argv
     if cron:
-        log("[aa_rank] --cron deprecated -> remap via cache (0 API hit); use --fetch 1x/hari + --remap/--cron for remap")
+        log("[aa_rank] --cron deprecated -> full discovery remap")
         sys.exit(do_remap(write=True, with_vision=vision_with_combos, dry=False, use_cache=True))
     alias = load_alias()
     log(f"[aa_rank] alias {len(alias)} entries vision_only={vision_only} with_vision={vision_with_combos} (legacy path: add --fetch/--remap for cache mode)")

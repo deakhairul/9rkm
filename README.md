@@ -8,7 +8,8 @@ Supporting tooling for a self-hosted [9Router](https://www.npmjs.com/package/dec
 
 | File | Role |
 |---|---|
-| `key_manager.py` | **9RKM** — key-manager daemon: 5s error scan → auto-OFF, 5-hour reset cycle, retire logic, Web UI + Telegram control |
+| `key_manager.py` | **9RKM** — key-manager daemon: 5s error scan → auto-OFF, 5-hour reset + combo-remap cycle, retire logic, Web UI |
+| `aa_rank.py` | Discovers every active provider catalog, ranks candidates by Artificial Analysis, probes best-to-worst until one works, then writes one model/provider/combo |
 | `9rkm-index.html` | 9RKM Web UI (dark theme, single file, no build step) |
 | `9rkm.service` | systemd unit for the daemon |
 | `bot_hub.py` | **Bot Hub** — single poller for multiple Telegram bots, HTTP-dispatches updates to each project (avoids Telegram 409 conflicts) |
@@ -28,15 +29,16 @@ Supporting tooling for a self-hosted [9Router](https://www.npmjs.com/package/dec
  (gateway log)   │  ≥3 consecutive errors → key OFF    │──► Telegram alert
                  ├─────────────────────────────────────┤
                  │  cycle thread (every 5h)            │
-                 │  reset ON all non-retired keys,     │──► SQLite state (kv table)
-                 │  clear errorCode, retire ≥50 cycles │
+                 │  reset keys → discover/rank/probe   │──► SQLite state + combos
+                 │  one active model/provider/combo    │
                  ├─────────────────────────────────────┤
                  │  HTTP thread (Web UI + API)         │◄── browser / curl
                  └─────────────────────────────────────┘
 ```
 
 - **Auto-OFF**: a key with ≥3 consecutive errors (or a gateway-set `errorCode`) is deactivated within 5 seconds.
-- **Reset cycle**: every 5 hours all non-retired keys are re-enabled and their error state is cleared — bad keys get re-tested automatically.
+- **Reset cycle**: every 5 hours all non-retired keys are re-enabled and their error state is cleared.
+- **Combo remap**: after reset, fresh Artificial Analysis scores and the live 9Router catalog are loaded. Candidates are ranked independently for Intelligence and Agentic; each provider is probed from best to worst until one returns HTTP 2xx. Failed/rate-limited candidates fall through to the next model.
 - **Retire**: a key failing ≥50 cycles is marked retired and stays OFF until manual action.
 - **Bulk ops**: ACTIVATE ALL / DEACTIVATE ALL from the Web UI (with confirmation dialog).
 - **Toggle**: the whole auto-OFF mechanism can be paused from the UI; state persists in the gateway's `kv` table.

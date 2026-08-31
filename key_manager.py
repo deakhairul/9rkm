@@ -27,7 +27,12 @@ CYCLE_SECONDS = CYCLE_HOURS * 3600
 SLEEP_INTERVAL = 5
 REMAP_LOCK = "/tmp/9rkm-remap.lock"
 REMAP_DEBOUNCE_SEC = 1800
+REMAP_STALE_SEC = 1800
 REMAP_LOG = "/tmp/aa_remap_last.log"
+REMAP_PROBING = threading.Event()
+REMAP_CYCLE_SCOPE = "aa_remap_cycle"
+REMAP_CYCLE_KEY = "state"
+COMBO_NAMES = ("Artificial-Analysis-Intelligence-Index", "Artificial-Analysis-Agentic-Index")
 EC_HINT = {400: "Request salah", 401: "Kunci salah/expired", 402: "Saldo habis", 403: "Akses ditolak", 429: "Kuota habis"}
 
 def _hint(ec):
@@ -103,6 +108,38 @@ def provider_label(provider, data=None):
                 return value.strip()
     return provider or "unknown"
 
+def _remap_lock_state():
+    try:
+        import fcntl
+        descriptor = os.open(REMAP_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            return False
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(descriptor)
+    except Exception:
+        return False
+
+def _acquire_remap_lock():
+    import fcntl
+    descriptor = os.open(REMAP_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.ftruncate(descriptor, 0)
+        os.write(descriptor, str(os.getpid()).encode())
+        return descriptor
+    except BlockingIOError:
+        os.close(descriptor)
+        return None
+
+def _release_remap_lock(descriptor):
+    import fcntl
+    fcntl.flock(descriptor, fcntl.LOCK_UN)
+    os.close(descriptor)
+
 def _remap_snapshot(cursor):
     out = {"lastAt": None, "lastWib": None, "source": None, "intel": None, "agentic": None, "vision": None, "cacheAt": None, "cacheAgeH": None, "locked": False, "cooldownSec": 0}
     try:
@@ -147,62 +184,125 @@ def _remap_snapshot(cursor):
                     pass
     except Exception:
         pass
-    try:
-        if os.path.exists(REMAP_LOCK):
-            age = time.time() - os.path.getmtime(REMAP_LOCK)
-            if age < 300:
-                out["locked"] = True
-            else:
-                try:
-                    os.remove(REMAP_LOCK)
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    out["locked"] = _remap_lock_state()
     return out
+
+def _combo_snapshot():
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        return {name: (cur.execute("SELECT models FROM combos WHERE name=?", (name,)).fetchone() or [None])[0] for name in COMBO_NAMES}
+    finally:
+        conn.close()
+
+def _restore_combos(snapshot):
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        for name, models in snapshot.items():
+            if models is None:
+                cur.execute("DELETE FROM combos WHERE name=?", (name,))
+            else:
+                cur.execute("UPDATE combos SET models=? WHERE name=?", (models, name))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def _probe_combo(name):
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT key FROM apiKeys LIMIT 1").fetchone()
+        api_key = row[0] if row else None
+    finally:
+        conn.close()
+    if not api_key:
+        return False
+    payload = json.dumps({"model": name, "messages": [{"role": "user", "content": "Reply PONG only"}], "max_tokens": 64, "stream": False}).encode()
+    request = urllib.request.Request("http://127.0.0.1:20128/v1/chat/completions", data=payload, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            response.read()
+            return 200 <= response.status < 300
+    except Exception:
+        return False
+
+def _cycle_state():
+    conn = get_db()
+    try:
+        return load_state_from_db(conn.cursor(), REMAP_CYCLE_SCOPE, REMAP_CYCLE_KEY)
+    finally:
+        conn.close()
+
+def _save_cycle_state(state):
+    conn = get_db()
+    try:
+        save_state_to_db(conn.cursor(), state, REMAP_CYCLE_SCOPE, REMAP_CYCLE_KEY)
+        conn.commit()
+    finally:
+        conn.close()
+
+def _restart_router():
+    result = subprocess.run(["pm2", "restart", "9router"], capture_output=True, text=True, timeout=30)
+    return result.returncode == 0
+
+def _run_remap(force=False):
+    cycle_id = get_cycle_id()
+    if not force and _cycle_state().get("successCycle") == cycle_id:
+        return 0
+    descriptor = _acquire_remap_lock()
+    if descriptor is None:
+        log("[Remap] locked skip")
+        return 5
+    snapshot = None
+    try:
+        REMAP_PROBING.set()
+        _, _, reset_status = run_reset()
+        if reset_status != "ok":
+            return 4
+        snapshot = _combo_snapshot()
+        log("[Remap] start discovery cycle")
+        child_env = {**os.environ, "AA_REMAP_LOCK_HELD": "1"}
+        result = subprocess.run(
+            ["/usr/bin/python3", "/home/ubuntu/scripts/9rkm/aa_rank.py", "--remap", "--no-vision"],
+            capture_output=True,
+            text=True,
+            timeout=1200,
+            env=child_env,
+        )
+        output = (result.stdout or "")[-16000:] + (result.stderr or "")[-4000:]
+        pathlib.Path(REMAP_LOG).write_text(output, encoding="utf-8")
+        if result.returncode != 0:
+            raise RuntimeError(f"aa_rank exit {result.returncode}")
+        if not _restart_router():
+            raise RuntimeError("pm2 restart failed")
+        if not all(_probe_combo(name) for name in COMBO_NAMES):
+            raise RuntimeError("combo E2E failed")
+        _save_cycle_state({"successCycle": cycle_id, "at": get_iso_now(), "status": "ok"})
+        log("[Remap] verified E2E")
+        return 0
+    except Exception as error:
+        log(f"[Remap] error {error}")
+        if snapshot is not None:
+            try:
+                _restore_combos(snapshot)
+                _restart_router()
+                log("[Remap] combo rollback restored")
+            except Exception as rollback_error:
+                log(f"[Remap] rollback failed {rollback_error}")
+        _save_cycle_state({"successCycle": _cycle_state().get("successCycle"), "attemptCycle": cycle_id, "at": get_iso_now(), "status": f"error:{error}"})
+        return 4
+    finally:
+        REMAP_PROBING.clear()
+        _release_remap_lock(descriptor)
 
 def _run_remap_async(force=False):
     def worker():
-        try:
-            if os.path.exists(REMAP_LOCK) and (time.time()-os.path.getmtime(REMAP_LOCK) < 300):
-                log("[Remap] locked skip")
-                return
-            pathlib.Path(REMAP_LOCK).write_text(str(os.getpid()))
-        except Exception as e:
-            log(f"[Remap] lock fail {e}")
-            return
-        try:
-            log(f"[Remap] start force={force}")
-            out = ""
-            if force:
-                try:
-                    r = subprocess.run(["/usr/bin/python3","/home/ubuntu/scripts/9rkm/aa_rank.py","--fetch"], capture_output=True, text=True, timeout=60)
-                    out += (r.stdout or "")[-2000:] + (r.stderr or "")[-2000:]
-                    log(f"[Remap] fetch exit={r.returncode}")
-                except Exception as e:
-                    out += f" fetch err {e}"
-            try:
-                child_env = {**os.environ, "AA_REMAP_LOCK_HELD": "1"}
-                r2 = subprocess.run(["/usr/bin/python3","/home/ubuntu/scripts/9rkm/aa_rank.py","--remap"], capture_output=True, text=True, timeout=180, env=child_env)
-                out += "\n---remap---\n" + (r2.stdout or "")[-3000:] + (r2.stderr or "")[-3000:]
-                log(f"[Remap] remap exit={r2.returncode}")
-                if r2.returncode == 0:
-                    try:
-                        subprocess.run(["pm2","restart","9router"], timeout=15)
-                    except Exception as ex:
-                        log(f"[Remap] pm2 fail {ex}")
-            except Exception as e:
-                out += f" remap err {e}"
-            try:
-                pathlib.Path(REMAP_LOG).write_text(out[-8000:], encoding="utf-8")
-            except Exception:
-                pass
-            notify(f"Remap combo selesai force={force} @ {get_iso_now()}")
-        finally:
-            try:
-                os.remove(REMAP_LOCK)
-            except Exception:
-                pass
+        code = _run_remap(True)
+        notify(f"Remap combo selesai force={force} exit={code} @ {get_iso_now()}")
     threading.Thread(target=worker, daemon=True).start()
 
 
@@ -295,6 +395,8 @@ def candidates_from_error_code(active_map, requests_by_conn, cutoff_iso, bulk_at
     return found
 
 def run_scan_tick():
+    if REMAP_PROBING.is_set():
+        return 0, "remap-probing"
     now_wib = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7)))
     today_wib = now_wib.strftime("%Y-%m-%d")
     cutoff_iso = get_cutoff_iso(1)
@@ -579,13 +681,13 @@ def run_reset():
             pass
 
 def reset_cycle_thread():
-    last_cycle = get_cycle_id()
     while True:
-        cur = get_cycle_id()
-        if cur != last_cycle:
-            run_reset()
-            last_cycle = cur
-        time.sleep(30)
+        current = get_cycle_id()
+        if _cycle_state().get("successCycle") != current:
+            code = _run_remap()
+            time.sleep(300 if code else 30)
+        else:
+            time.sleep(30)
 
 # ---------- Status snapshot (dipakai TG + Web) ----------
 

@@ -154,14 +154,18 @@ def fetch_api_all():
 def is_free(mid: str) -> bool:
     value = (mid or "").lower()
     suffix = value.split("/", 1)[1] if "/" in value else value
-    return suffix.endswith(":free") or suffix.endswith("-free") or "free" in suffix.split("/")
+    return suffix.endswith(":free") or suffix.endswith("-free") or "free" in suffix.split("/") or "/free" in suffix
 
 def model_is_free(model):
     pricing = model.get("pricing") if isinstance(model, dict) else None
     if isinstance(pricing, dict):
         try:
-            if float(pricing.get("prompt", 1)) == 0 and float(pricing.get("completion", 1)) == 0:
+            prompt = float(pricing.get("prompt", 1))
+            completion = float(pricing.get("completion", 1))
+            if prompt == 0 and completion == 0:
                 return True
+            if prompt > 0 or completion > 0:
+                return False  # pricing eksplisit non-nol menang atas string id
         except (TypeError, ValueError):
             pass
     return is_free(str(model.get("id") or ""))
@@ -458,9 +462,7 @@ def probe_vision_native(mid, api_key, timeout=PROBE_TIMEOUT):
             if "no active credentials" in low or "model_not_found" in low:
                 return "down"
             if "bad_request" in low:
-                if _is_model_rejected(body) or _is_payment_rejected(body):
-                    return "down" if _is_model_rejected(body) else "down"
-                return "ok"
+                return "down"  # ADR 0003: 400 = gagal kandidat (pernah lolos salah via ternary broken)
             if max_tok == 32:
                 return "fail"
             time.sleep(PROBE_RETRY_SLEEP)
@@ -472,28 +474,17 @@ def probe_vision_native(mid, api_key, timeout=PROBE_TIMEOUT):
     return "fail"
 
 def filter_vision_native(conn, scored):
+    """Probe vision native TANPA mematikan capacityAdapter (ADR 0003):
+    probe pool adapter bypass — pemilihan kandidat vision hanya dari model
+    yang punya skor AA + ada di katalog, hasil probe di bawah adapter tetap
+    berlaku karena 1x1 PNG pasti ditolak pool adapter dgn no_vision/down
+    yang sama kandidatnya di-skip; tidak ada mutasi settings gateway."""
     if not scored:
         return scored
     api_key = router_key_via_db(conn)
     if not api_key:
         log("[aa_rank] WARN no router apiKey, skip vision probe")
         return scored
-    tmp_rows = conn.execute("SELECT data FROM settings WHERE id=1").fetchone()
-    orig = None
-    if tmp_rows:
-        try:
-            orig = json.loads(tmp_rows[0])
-        except Exception:
-            orig = None
-    if orig and orig.get("capacityAdapter", {}).get("vision", {}).get("enabled"):
-        try:
-            tmp = json.loads(tmp_rows[0])
-            tmp["capacityAdapter"]["vision"]["enabled"] = False
-            conn.execute("UPDATE settings SET data=? WHERE id=1", (json.dumps(tmp),))
-            conn.commit()
-            log("[aa_rank] vision adapter disabled for native probe")
-        except Exception as ex:
-            log(f"[aa_rank] adapter disable fail {ex}")
     def do_probe(item):
         mid, _, _ = item
         st = probe_vision_native(mid, api_key)
@@ -505,16 +496,6 @@ def filter_vision_native(conn, scored):
             item, st = f.result()
             results[item[0]] = st
             log(f"[aa_rank] vision probe {st:10} {item[0]}")
-    if orig and orig.get("capacityAdapter", {}).get("vision", {}).get("enabled"):
-        try:
-            cur = conn.execute("SELECT data FROM settings WHERE id=1").fetchone()
-            cur_data = json.loads(cur[0]) if cur else {}
-            cur_data["capacityAdapter"] = orig.get("capacityAdapter", cur_data.get("capacityAdapter", {}))
-            conn.execute("UPDATE settings SET data=? WHERE id=1", (json.dumps(cur_data),))
-            conn.commit()
-            log("[aa_rank] vision adapter restored")
-        except Exception as ex:
-            log(f"[aa_rank] adapter restore fail {ex}")
     kept = []
     for mid, label, score in scored:
         st = results.get(mid, "fail")
@@ -976,30 +957,29 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
     return 0
 
 def do_remap(write=True, with_vision=True, dry=False, use_cache=True):
-    lock_path = "/tmp/9rkm-remap.lock"
     if os.environ.get("AA_REMAP_LOCK_HELD") == "1":
         return _do_remap_unlocked(write, with_vision, dry, use_cache)
+    lock_path = "/tmp/9rkm-remap.lock"
     try:
-        descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(descriptor, str(os.getpid()).encode())
+        import fcntl
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    except Exception as error:
+        log(f"[aa_rank] lock open fail {error}", file=sys.stderr)
+        return 5
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        log("[aa_rank] SKIP remap locked (flock)")
         os.close(descriptor)
-    except FileExistsError:
-        try:
-            age = time.time() - os.path.getmtime(lock_path)
-            if age >= 1800:
-                os.remove(lock_path)
-                return do_remap(write, with_vision, dry, use_cache)
-            log(f"[aa_rank] SKIP remap locked age={age:.0f}s")
-        except Exception:
-            log("[aa_rank] SKIP remap locked")
         return 5
     try:
         return _do_remap_unlocked(write, with_vision, dry, use_cache)
     finally:
         try:
-            os.remove(lock_path)
-        except FileNotFoundError:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except Exception:
             pass
+        os.close(descriptor)
 
 def main():
     if "--fetch" in sys.argv:

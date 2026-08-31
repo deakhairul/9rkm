@@ -3,9 +3,10 @@
 9RKM - 9Router Key Manager (2026-08-18)
 Satu daemon menggantikan key-disable-daemon.py + daily-key-check.py + hourly-key-disable.py:
   - Thread scan 5s   : auto-OFF key error (logika kronologis daemon lama, identik)
-  - Thread cycle 5 jam: reset ON semua non-retired + json_remove errorCode + retire >=50 siklus
+  - Thread cycle 5 jam: remap combo (side-effect-free) lalu reset ON semua key + json_remove errorCode
   - Thread HTTP      : Web UI parity (status + toggle), Tailscale-only
 Toggle di scope KV 'key_auto_off_toggle' - terpisah dari state 'hourly_key_disable'.
+Konsep retire dihapus (ADR 0001): key error = cari akar masalah, diuji ulang tiap siklus.
 """
 import sys, os, time, json, sqlite3, html, datetime, threading
 import urllib.request, urllib.error, urllib.parse
@@ -21,7 +22,6 @@ KV_SCOPE = "hourly_key_disable"
 KV_KEY = "state"
 TOGGLE_SCOPE = "key_auto_off_toggle"
 TOGGLE_KEY = "state"
-MAX_FAILED_CYCLES = 50
 CYCLE_HOURS = 5
 CYCLE_SECONDS = CYCLE_HOURS * 3600
 SLEEP_INTERVAL = 5
@@ -48,7 +48,11 @@ def _hint(ec):
 
 def log(msg):
     ts = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7))).strftime("%Y-%m-%d %H:%M:%S WIB")
-    print(f"{ts} | {msg}", flush=True)
+    try:
+        print(f"{ts} | {msg}", flush=True)
+    except UnicodeEncodeError:
+        safe = f"{ts} | {msg}".encode("ascii", "replace").decode("ascii")
+        print(safe, flush=True)
 
 def get_db():
     conn = sqlite3.connect(DB, timeout=5.0)
@@ -253,6 +257,10 @@ def _run_remap(force=False):
     cycle_id = get_cycle_id()
     if not force and _cycle_state().get("successCycle") == cycle_id:
         return 0
+    enabled, _ = get_toggle()
+    if not enabled:
+        log("[Remap] skip (toggle OFF)")
+        return 0
     descriptor = _acquire_remap_lock()
     if descriptor is None:
         log("[Remap] locked skip")
@@ -260,9 +268,6 @@ def _run_remap(force=False):
     snapshot = None
     try:
         REMAP_PROBING.set()
-        _, _, reset_status = run_reset()
-        if reset_status != "ok":
-            return 4
         snapshot = _combo_snapshot()
         log("[Remap] start discovery cycle")
         child_env = {**os.environ, "AA_REMAP_LOCK_HELD": "1"}
@@ -281,8 +286,11 @@ def _run_remap(force=False):
             raise RuntimeError("pm2 restart failed")
         if not all(_probe_combo(name) for name in COMBO_NAMES):
             raise RuntimeError("combo E2E failed")
+        _, _, reset_status = run_reset()
+        if reset_status != "ok":
+            raise RuntimeError(f"reset after remap {reset_status}")
         _save_cycle_state({"successCycle": cycle_id, "at": get_iso_now(), "status": "ok"})
-        log("[Remap] verified E2E")
+        log("[Remap] verified E2E + reset")
         return 0
     except Exception as error:
         log(f"[Remap] error {error}")
@@ -463,7 +471,6 @@ def run_scan_tick():
                     state[cid].pop("consecutive_off_days", None)
                     state[cid].pop("off_cycle_id", None)
                     state[cid].pop("counted_cycle_id", None)
-                    state[cid]["is_retired"] = False
 
         candidates = candidates_from_error_code(active_map, requests_by_conn, cutoff_iso, bulk_at_iso, bulk_grace_iso)
 
@@ -484,7 +491,7 @@ def run_scan_tick():
             name = info.get("name", prov)
             conn_state = state.get(cid, {
                 "provider": prov, "name": name, "consecutive_off_days": 0,
-                "last_off_date": "", "is_retired": False, "manual_off": False, "auto_off_ts": ""
+                "last_off_date": "", "manual_off": False, "auto_off_ts": ""
             })
             conn_state["provider"] = prov
             conn_state["name"] = name
@@ -543,7 +550,6 @@ def bulk_activate_all(by="WebUI"):
         for cid in ids:
             st = state.get(cid, {})
             st["failed_cycles"] = 0
-            st["is_retired"] = False
             st.pop("consecutive_off_days", None)
             st.pop("off_cycle_id", None)
             st.pop("counted_cycle_id", None)
@@ -573,7 +579,7 @@ def bulk_deactivate_all(by="WebUI"):
             cur.execute(f"UPDATE providerConnections SET isActive = 0, updatedAt = ? WHERE id IN ({ph});", [now] + ids)
         state = load_state_from_db(cur)
         for cid in ids:
-            st = state.get(cid, {"failed_cycles": 0, "is_retired": False})
+            st = state.get(cid, {"failed_cycles": 0})
             st["manual_off"] = True
             st["manual_off_at"] = now
             st["manual_off_by"] = by
@@ -588,36 +594,9 @@ def bulk_deactivate_all(by="WebUI"):
     finally:
         conn.close()
 
-# ---------- Cycle 5 jam (reset ON + retire) ----------
-
-def reconcile_state_and_connections(conns, state):
-    to_activate = []
-    retired = []
-    for c in conns:
-        cid = c["id"]
-        cstate = state.get(cid)
-        if cstate and cstate.get("manual_off"):
-            retired.append({**c, "failed_cycles": cstate.get("failed_cycles", 0)})
-            continue
-        if cstate:
-            is_ret = cstate.get("is_retired", False)
-            failed_cycles = cstate.get("failed_cycles", cstate.get("consecutive_off_days", 0))
-            if is_ret or failed_cycles >= MAX_FAILED_CYCLES:
-                cstate["is_retired"] = True
-                cstate["failed_cycles"] = max(cstate.get("failed_cycles", 0), MAX_FAILED_CYCLES)
-                cstate.pop("manual_off", None)
-                cstate.pop("auto_off_ts", None)
-                state[cid] = cstate
-                retired.append({**c, "failed_cycles": cstate["failed_cycles"]})
-                continue
-            if "manual_off" in cstate or "auto_off_ts" in cstate:
-                cstate.pop("manual_off", None)
-                cstate.pop("auto_off_ts", None)
-                state[cid] = cstate
-            to_activate.append(c)
-        else:
-            to_activate.append(c)
-    return to_activate, retired
+# ---------- Cycle 5 jam (reset ON) ----------
+# Keputusan Dea 31 Agu: TIDAK ada istilah manual off yang berbeda — semua OFF diperlakukan setara,
+# semua key diuji ulang tiap siklus (lihat ADR 0001). manual_off hanya jejak histori di KV.
 
 def run_reset():
     conn = get_db()
@@ -630,16 +609,7 @@ def run_reset():
 
         cursor.execute("SELECT id, provider, name, email, isActive, data, updatedAt FROM providerConnections;")
         rows = cursor.fetchall()
-        conns = []
-        for r in rows:
-            try:
-                data = json.loads(r["data"]) if r["data"] else {}
-            except Exception:
-                data = {}
-            conns.append({"id": r["id"], "provider": provider_label(r["provider"], data), "name": r["name"] or r["provider"], "isActive": r["isActive"], "updatedAt": r["updatedAt"]})
-
-        state = load_state_from_db(cursor)
-        to_activate, retired = reconcile_state_and_connections(conns, state)
+        to_activate = [{"id": r["id"]} for r in rows]
         now_iso = get_iso_now()
 
         if to_activate:
@@ -655,18 +625,20 @@ def run_reset():
             )
             log(f"ON: {len(to_activate)} koneksi diaktifkan kembali (state error dibersihkan).")
 
-        if retired:
-            ret_ids = [c["id"] for c in retired]
-            placeholders = ",".join("?" for _ in ret_ids)
-            cursor.execute(
-                f"UPDATE providerConnections SET isActive = 0, updatedAt = ? WHERE id IN ({placeholders});",
-                [now_iso] + ret_ids
-            )
-            log(f"RETIRED: {len(retired)} koneksi tetap OFF (>= {MAX_FAILED_CYCLES} siklus gagal).")
-
+        state = load_state_from_db(cursor)
+        for cid in (c["id"] for c in to_activate):
+            st = state.get(cid, {})
+            st["failed_cycles"] = 0
+            st.pop("consecutive_off_days", None)
+            st.pop("off_cycle_id", None)
+            st.pop("counted_cycle_id", None)
+            st.pop("manual_off", None)
+            st.pop("manual_off_at", None)
+            st.pop("auto_off_ts", None)
+            state[cid] = st
         save_state_to_db(cursor, state)
         conn.commit()
-        return len(to_activate), len(retired), "ok"
+        return len(to_activate), 0, "ok"
     except Exception as e:
         log(f"[-] Reset error: {e}")
         try:
@@ -683,7 +655,8 @@ def run_reset():
 def reset_cycle_thread():
     while True:
         current = get_cycle_id()
-        if _cycle_state().get("successCycle") != current:
+        enabled, _ = get_toggle()
+        if enabled and _cycle_state().get("successCycle") != current:
             code = _run_remap()
             time.sleep(300 if code else 30)
         else:
@@ -724,11 +697,11 @@ def status_snapshot():
             connection_labels[row["id"]] = (provider_label(row["provider"], data), row["name"] or row["provider"])
             conn_data[row["id"]] = data
         state = load_state_from_db(cur)
-        retired = []
+        problem = []
         for cid, item in state.items():
-            if item.get("is_retired"):
+            if item.get("failed_cycles", 0) >= 3:
                 label, fallback_name = connection_labels.get(cid, (item.get("provider", "unknown"), item.get("name", "-")))
-                retired.append({"provider": label, "name": item.get("name") or fallback_name, "failed_cycles": item.get("failed_cycles", 0)})
+                problem.append({"provider": label, "name": item.get("name") or fallback_name, "failed_cycles": item.get("failed_cycles", 0)})
         bulk_last = load_state_from_db(cur, BULK_SCOPE, BULK_KEY)
         keys = []
         for row in conn_rows:
@@ -738,12 +711,10 @@ def status_snapshot():
             name = (row["name"] or "").strip() or (row["email"] or "").strip() or cid[:8]
             st = state.get(cid, {})
             failed = st.get("failed_cycles", st.get("consecutive_off_days", 0))
-            if st.get("manual_off"):
-                status = "Manual OFF"
-            elif st.get("is_retired"):
-                status = "Pensiun"
-            elif not row["isActive"]:
+            if not row["isActive"]:
                 status = "OFF"
+                if st.get("manual_off_by"):
+                    status = "OFF (bulk)"
             else:
                 status = "Aktif"
             ec = d.get("errorCode")
@@ -777,8 +748,8 @@ def status_snapshot():
             "total": total,
             "active": active,
             "by_provider": by_prov,
-            "retired_count": len(retired),
-            "retired": retired,
+            "problem_count": len(problem),
+            "problem": problem,
             "bulk_last": bulk_last if bulk_last else None,
             "remap": remap,
             "keys": keys,
@@ -847,9 +818,8 @@ def tg_status_text():
         f"Toggle: {toggle}\n"
         f"Key aktif: <b>{s['active']}/{s['total']}</b>\n"
         f"Provider: {provs or '-'}\n"
-        f"Retired: {s['retired_count']}\n"
+        f"OFF berulang (≥3 siklus): {s['problem_count']}\n"
         f"{timer}\n\n"
-        f"Threshold auto-retire: ≥{MAX_FAILED_CYCLES} siklus ({CYCLE_HOURS} jam/siklus)\n"
         f"⏱ {s['ts']}"
     )
 

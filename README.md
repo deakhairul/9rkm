@@ -24,24 +24,24 @@ Supporting tooling for a self-hosted [9Router](https://www.npmjs.com/package/dec
 ## 9RKM — how it works
 
 ```
-                 ┌─────────────────────────────────────┐
+                  ┌─────────────────────────────────────┐
  requestDetails ─┤  scan thread (every 5s)             │
- (gateway log)   │  ≥3 consecutive errors → key OFF    │──► Telegram alert
-                 ├─────────────────────────────────────┤
-                 │  cycle thread (every 5h)            │
-                 │  reset keys → discover/rank/probe   │──► SQLite state + combos
-                 │  one active model/provider/combo    │
-                 ├─────────────────────────────────────┤
-                 │  HTTP thread (Web UI + API)         │◄── browser / curl
-                 └─────────────────────────────────────┘
+ (gateway log)   │  fresh errorCode → key OFF          │──► web_alerts.json
+                  ├─────────────────────────────────────┤
+                  │  cycle thread (every 5h)            │
+                  │  discover/rank/probe → remap combos  │──► SQLite combos
+                  │  E2E OK → reset keys ON              │
+                  │  one active model/provider/combo     │
+                  ├─────────────────────────────────────┤
+                  │  HTTP thread (Web UI + API)         │◄── browser / curl
+                  └─────────────────────────────────────┘
 ```
 
-- **Auto-OFF**: a key with ≥3 consecutive errors (or a gateway-set `errorCode`) is deactivated within 5 seconds.
-- **Reset cycle**: every 5 hours all non-retired keys are re-enabled and their error state is cleared.
-- **Combo remap**: after reset, fresh Artificial Analysis scores and the live 9Router catalog are loaded. Candidates are ranked independently for Intelligence and Agentic; each provider is probed from best to worst until one returns HTTP 2xx. Failed/rate-limited candidates fall through to the next model.
-- **Retire**: a key failing ≥50 cycles is marked retired and stays OFF until manual action.
+- **Auto-OFF**: a key with a gateway-set `errorCode` (fresh ≤1h, no success after it) is deactivated within 5 seconds. Probes/scan activity during a remap cycle is paused so test traffic can never disable keys.
+- **Reset cycle + remap**: every 5 hours the remap runs first (fresh Artificial Analysis scores + live catalog discovery, candidates probed best-to-worst per provider until HTTP 2xx, one model per provider per combo). Only after a successful remap + E2E are all keys re-enabled and their error state cleared — a failed remap leaves the DB untouched (combo rollback + no key reset).
+- **No retire**: keys are never permanently retired. A key that keeps failing cycles is surfaced in the UI as "OFF berulang (≥3 siklus)" so the root cause gets investigated — every cycle it gets re-tested automatically.
 - **Bulk ops**: ACTIVATE ALL / DEACTIVATE ALL from the Web UI (with confirmation dialog).
-- **Toggle**: the whole auto-OFF mechanism can be paused from the UI; state persists in the gateway's `kv` table.
+- **Toggle**: the whole auto-OFF mechanism can be paused from the UI; state persists in the gateway's `kv` table. Toggle OFF also stops remap scheduling.
 
 ![9RKM Web UI](docs/9rkm-webui.png)
 

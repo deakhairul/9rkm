@@ -10,3 +10,4 @@ auth/
 *.log
 data.sqlite
 __pycache__/
+web_alerts.json

@@ -326,6 +326,14 @@ def load_state_from_db(cursor, scope=KV_SCOPE, key=KV_KEY):
             pass
     return {}
 
+def _state_row_active(db_path, cid):
+    """Helper test/inspeksi: isActive satu koneksi."""
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute("SELECT isActive FROM providerConnections WHERE id=?", (cid,)).fetchone()[0]
+    finally:
+        conn.close()
+
 def save_state_to_db(cursor, state, scope=KV_SCOPE, key=KV_KEY):
     json_str = json.dumps(state, indent=2)
     cursor.execute(
@@ -467,10 +475,15 @@ def run_scan_tick():
         for cid, reqs in requests_by_conn.items():
             if reqs and str(reqs[-1][1]).strip().lower() == "success":
                 if cid in state:
-                    state[cid]["failed_cycles"] = 0
-                    state[cid].pop("consecutive_off_days", None)
-                    state[cid].pop("off_cycle_id", None)
-                    state[cid].pop("counted_cycle_id", None)
+                    auto_off_ts = state[cid].get("auto_off_ts") or ""
+                    latest_success = reqs[-1][0]  # reqs sorted ASC → sukses terakhir
+                    if not auto_off_ts or latest_success > auto_off_ts:
+                        # Sukses nyata SETELAH auto-off terakhir = bukti sembuh → reset streak (ADR 0001)
+                        state[cid]["failed_cycles"] = 0
+                        state[cid].pop("consecutive_off_days", None)
+                        state[cid].pop("off_cycle_id", None)
+                        state[cid].pop("counted_cycle_id", None)
+                        state[cid].pop("auto_off_ts", None)
 
         candidates = candidates_from_error_code(active_map, requests_by_conn, cutoff_iso, bulk_at_iso, bulk_grace_iso)
 
@@ -549,12 +562,11 @@ def bulk_activate_all(by="WebUI"):
         state = load_state_from_db(cur)
         for cid in ids:
             st = state.get(cid, {})
-            st["failed_cycles"] = 0
+            # failed_cycles DIPERTAHANKAN (ADR 0001): menyalakan key bukan bukti sembuh
             st.pop("consecutive_off_days", None)
-            st.pop("off_cycle_id", None)
-            st.pop("counted_cycle_id", None)
             st.pop("manual_off", None)
             st.pop("manual_off_at", None)
+            st.pop("manual_off_by", None)
             st.pop("auto_off_ts", None)
             state[cid] = st
         bulk = {"action": "activate_all", "by": by, "at": now, "n": len(ids)}
@@ -628,12 +640,11 @@ def run_reset():
         state = load_state_from_db(cursor)
         for cid in (c["id"] for c in to_activate):
             st = state.get(cid, {})
-            st["failed_cycles"] = 0
+            # failed_cycles DIPERTAHANKAN: bukti investigasi hanya dihapus oleh request sukses nyata (ADR 0001)
             st.pop("consecutive_off_days", None)
-            st.pop("off_cycle_id", None)
-            st.pop("counted_cycle_id", None)
             st.pop("manual_off", None)
             st.pop("manual_off_at", None)
+            st.pop("manual_off_by", None)
             st.pop("auto_off_ts", None)
             state[cid] = st
         save_state_to_db(cursor, state)
@@ -699,8 +710,8 @@ def status_snapshot():
         state = load_state_from_db(cur)
         problem = []
         for cid, item in state.items():
-            if item.get("failed_cycles", 0) >= 3:
-                label, fallback_name = connection_labels.get(cid, (item.get("provider", "unknown"), item.get("name", "-")))
+            if item.get("failed_cycles", 0) >= 3 and cid in connection_labels:
+                label, fallback_name = connection_labels[cid]
                 problem.append({"provider": label, "name": item.get("name") or fallback_name, "failed_cycles": item.get("failed_cycles", 0)})
         bulk_last = load_state_from_db(cur, BULK_SCOPE, BULK_KEY)
         keys = []
@@ -713,7 +724,7 @@ def status_snapshot():
             failed = st.get("failed_cycles", st.get("consecutive_off_days", 0))
             if not row["isActive"]:
                 status = "OFF"
-                if st.get("manual_off_by"):
+                if st.get("manual_off"):
                     status = "OFF (bulk)"
             else:
                 status = "Aktif"
@@ -725,10 +736,8 @@ def status_snapshot():
                 ket = f"{ec} {_hint(ec)}"
                 if last_err:
                     ket += f" · {last_err}"
-                if failed:
-                    ket += f" · S{failed}"
-            elif not row["isActive"] and failed:
-                ket = f"S{failed}"
+            if failed:
+                ket = (ket + f" · S{failed}") if ket != "-" else f"S{failed}"
             elif not row["isActive"] and last_err:
                 ket = last_err
             keys.append({"key": name, "provider": prov_label, "status": status, "ket": ket})

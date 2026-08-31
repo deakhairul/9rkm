@@ -10,7 +10,9 @@
 
 ## Keputusan
 
-Hapus total: `MAX_FAILED_CYCLES`, `is_retired`, cabang retire di reset/reconcile, dan dead-end-nya. Setiap siklus SEMUA key diuji ulang — semua OFF diperlakukan setara (keputusan lanjutan Dea 31 Agu: "anggap saja tidak ada manual off"), `manual_off` hanya jejak histori di KV untuk label "OFF (bulk)". Key yang OFF berulang ≥3 siklus tampil di UI sebagai "OFF berulang" — murni sinyal investigasi akar masalah (error code + siklus di tabel Key), bukan perubahan perlakuan.
+Hapus total: `MAX_FAILED_CYCLES`, `is_retired`, cabang retire di reset/reconcile, dan dead-end-nya. Setiap siklus SEMUA key diuji ulang — semua OFF diperlakukan setara (keputusan lanjutan Dea 31 Agu: "anggap saja tidak ada manual off"), `manual_off` hanya jejak histori di KV untuk label "OFF (bulk)" saat masih aktif. Key yang Auto-OFF di ≥3 siklus berbeda sejak sukses nyata terakhir tampil di UI sebagai "OFF berulang" — murni sinyal investigasi akar masalah, bukan perubahan perlakuan.
+
+**Semantik counter (patch 31 Agu sore):** `failed_cycles` = jumlah siklus 5 jam berbeda ketika key Auto-OFF sejak request sukses nyata terakhir. Naik maksimal 1× per siklus (dedup `counted_cycle_id`). Reset siklus & ACTIVATE ALL **mempertahankan** counter — menyalakan key bukan bukti sembuh. Hanya request sukses dengan timestamp > `auto_off_ts` terakhir yang me-reset counter (sukses = bukti sembuh). DEACTIVATE ALL tidak menambah counter.
 
 ## Konsekuensi
 

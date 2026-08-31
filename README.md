@@ -8,7 +8,7 @@ Supporting tooling for a self-hosted [9Router](https://www.npmjs.com/package/dec
 
 | File | Role |
 |---|---|
-| `key_manager.py` | **9RKM** — key-manager daemon: 5s error scan → auto-OFF, 5-hour reset + combo-remap cycle, retire logic, Web UI |
+| `key_manager.py` | **9RKM** — key-manager daemon: 5s error scan → auto-OFF, 5-hour remap cycle (reset keys after successful E2E), Web UI |
 | `aa_rank.py` | Discovers every active provider catalog, ranks candidates by Artificial Analysis, probes best-to-worst until one works, then writes one model/provider/combo |
 | `9rkm-index.html` | 9RKM Web UI (dark theme, single file, no build step) |
 | `9rkm.service` | systemd unit for the daemon |
@@ -39,7 +39,7 @@ Supporting tooling for a self-hosted [9Router](https://www.npmjs.com/package/dec
 
 - **Auto-OFF**: a key with a gateway-set `errorCode` (fresh ≤1h, no success after it) is deactivated within 5 seconds. Probes/scan activity during a remap cycle is paused so test traffic can never disable keys.
 - **Reset cycle + remap**: every 5 hours the remap runs first (fresh Artificial Analysis scores + live catalog discovery, candidates probed best-to-worst per provider until HTTP 2xx, one model per provider per combo). Only after a successful remap + E2E are all keys re-enabled and their error state cleared — a failed remap leaves the DB untouched (combo rollback + no key reset).
-- **No retire**: keys are never permanently retired. A key that keeps failing cycles is surfaced in the UI as "OFF berulang (≥3 siklus)" so the root cause gets investigated — every cycle it gets re-tested automatically.
+- **No retire**: keys are never permanently retired. A key that Auto-OFFs in ≥3 different cycles since its last real success is surfaced as "OFF berulang (≥3 siklus)" for root-cause investigation — re-enabling it never clears the count; only a real successful request does.
 - **Bulk ops**: ACTIVATE ALL / DEACTIVATE ALL from the Web UI (with confirmation dialog).
 - **Toggle**: the whole auto-OFF mechanism can be paused from the UI; state persists in the gateway's `kv` table. Toggle OFF also stops remap scheduling.
 

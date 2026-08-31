@@ -15,4 +15,5 @@ Balik urutan: remap (snapshot → aa_rank → restart → E2E) dulu; `run_reset(
 
 - Gagal remap = nol efek samping; state key persis seperti sebelum siklus.
 - Reset kini hanya terjadi bersamaan dengan remap sukses — tidak ada lagi "reset tanpa remap" (setelah cron remap retired 31 Agu, memang tidak pernah ada jalur lain).
+- Reset membersihkan state transport gateway (errorCode/lastError/backoffLevel + `isActive=1`) tapi **mempertahankan** `failed_cycles` sebagai bukti investigasi — bukti hanya dihapus oleh request sukses nyata (lihat ADR 0001).
 - E2E berjalan dengan key dalam kondisi pra-siklus — kandidat yang butuh reset key untuk lolos akan gagal siklus ini dan lolos siklus berikutnya. Trade-off diterima: benar > cepat satu siklus.

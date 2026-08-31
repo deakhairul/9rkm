@@ -24,7 +24,7 @@ Glossary istilah domain 9RKM. Tanpa detail implementasi.
 
 **Kunci remap (remap lock)** — satu flock `/tmp/9rkm-remap.lock`, dipakai key_manager DAN aa_rank standalone. Tidak ada mekanisme lock kedua.
 
-**OFF berulang (problem key)** — key yang OFF ≥3 siklus berturut. Status INFORMASI untuk investigasi akar masalah — bukan status terminal, tidak mengubah perlakuan key sama sekali.
+**OFF berulang (problem key)** — key yang Auto-OFF di ≥3 siklus 5-jam berbeda **sejak request sukses nyata terakhir**. Reset/ACTIVATE ALL tidak menghapus bukti ini (menyalakan key ≠ sembuh); hanya request sukses setelah auto-off terakhir yang menghapusnya. Status INFORMASI untuk investigasi akar masalah — bukan status terminal, tidak mengubah perlakuan key sama sekali.
 
 ~~Retire / pensiun~~ — konsep DIHAPUS (ADR 0001). Tidak ada key terminal.
 

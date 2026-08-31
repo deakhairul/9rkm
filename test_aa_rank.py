@@ -1,5 +1,6 @@
 import aa_rank
 import key_manager
+import datetime as _datetime
 
 INTEL = "artificial_analysis_intelligence_index"
 AGENTIC = "artificial_analysis_agentic_index"
@@ -214,7 +215,13 @@ def _lifecycle_env():
     return km, db, tmp
 
 
-def _mk_conn(db, cid, active=1, error=None, err_at="2026-08-31T09:59:00.000Z"):
+def _fresh_ts():
+    # error fresh relatif waktu sekarang (mencegah test basi saat tanggal lewat window 1 jam)
+    return _datetime.datetime.now(_datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + "000Z"
+
+
+def _mk_conn(db, cid, active=1, error=None, err_at=None):
+    err_at = err_at or _fresh_ts()
     conn = _sqlite3.connect(db)
     existing = conn.execute("SELECT data FROM providerConnections WHERE id=?", (cid,)).fetchone()
     data = _json.loads(existing[0]) if existing else {}
@@ -250,7 +257,7 @@ def test_lifecycle_three_cycles_reach_S3():
     km.REMAP_PROBING.clear()
     try:
         for i in range(3):
-            _mk_conn(db, "c1", active=1, error=401, err_at="2026-08-31T10:00:00.000Z")
+            _mk_conn(db, "c1", active=1, error=401, err_at=_fresh_ts())
             km.get_cycle_id = lambda: _cycle(i)
             km.run_scan_tick()
             assert _state(db, "c1")["failed_cycles"] == i + 1, f"siklus {i}: {_state(db, 'c1')}"
@@ -275,7 +282,7 @@ def test_lifecycle_same_cycle_no_double_count():
     try:
         km.get_cycle_id = lambda: _cycle(0)
         for round in range(2):
-            _mk_conn(db, "c1", active=1, error=402, err_at="2026-08-31T10:00:00.000Z")
+            _mk_conn(db, "c1", active=1, error=402, err_at=_fresh_ts())
             km.run_scan_tick()
             _mk_conn(db, "c1", active=1)  # reaktivasi tanpa sukses
         assert _state(db, "c1")["failed_cycles"] == 1
@@ -289,7 +296,7 @@ def test_lifecycle_real_success_clears_counter():
     km, db, tmp = _lifecycle_env()
     try:
         km.get_cycle_id = lambda: _cycle(0)
-        _mk_conn(db, "c1", active=1, error=429, err_at="2026-08-31T10:00:00.000Z")
+        _mk_conn(db, "c1", active=1, error=429, err_at=_fresh_ts())
         km.run_scan_tick()
         assert _state(db, "c1")["failed_cycles"] == 1
         auto_off_ts = _state(db, "c1")["auto_off_ts"]
@@ -315,7 +322,7 @@ def test_lifecycle_success_then_new_fail_restarts_at_1():
     km, db, tmp = _lifecycle_env()
     try:
         km.get_cycle_id = lambda: _cycle(1)
-        _mk_conn(db, "c1", active=1, error=403, err_at="2026-08-31T10:00:00.000Z")
+        _mk_conn(db, "c1", active=1, error=403, err_at=_fresh_ts())
         km.run_scan_tick()
         # streak 1, sukses lalu fail lagi dalam siklus BARU → restart dari 1
         _mk_conn(db, "c1", active=1)
@@ -327,7 +334,7 @@ def test_lifecycle_success_then_new_fail_restarts_at_1():
         import time as _time
         _time.sleep(0.25)
         km.get_cycle_id = lambda: _cycle(2)
-        _mk_conn(db, "c1", active=1, error=403, err_at="2026-08-31T10:00:00.000Z")
+        _mk_conn(db, "c1", active=1, error=403, err_at=_fresh_ts())
         km.run_scan_tick()
         assert _state(db, "c1")["failed_cycles"] == 1, "sukses lalu gagal = streak baru mulai 1"
     finally:
@@ -340,7 +347,7 @@ def test_lifecycle_activate_all_preserves_counter():
     km, db, tmp = _lifecycle_env()
     try:
         km.get_cycle_id = lambda: _cycle(0)
-        _mk_conn(db, "c1", active=1, error=401, err_at="2026-08-31T10:00:00.000Z")
+        _mk_conn(db, "c1", active=1, error=401, err_at=_fresh_ts())
         km.run_scan_tick()
         km.bulk_activate_all("test")
         st = _state(db, "c1")
@@ -364,7 +371,13 @@ def test_lifecycle_deactivate_all_not_a_failure():
         # reset → aktif, lalu auto-off otomatis → label OFF (bukan stale OFF bulk)
         km.run_reset()
         km.get_cycle_id = lambda: _cycle(0)
-        _mk_conn(db, "c1", active=1, error=401, err_at="2026-08-31T10:00:00.000Z")
+        # error HARUS lebih baru dari bulk_at+10s (grace) agar jadi kandidat
+        c = _sqlite3.connect(db)
+        bulk_at = _json.loads(c.execute("SELECT value FROM kv WHERE scope='rkm_bulk' AND key='last'").fetchone()[0])["at"]
+        c.close()
+        base = _datetime.datetime.fromisoformat(bulk_at.replace("Z", "+00:00"))
+        err_ts = (base + _datetime.timedelta(seconds=11)).strftime("%Y-%m-%dT%H:%M:%S.") + "000Z"
+        _mk_conn(db, "c1", active=1, error=401, err_at=err_ts)
         km.run_scan_tick()
         snap = km.status_snapshot()
         k = [x for x in snap["keys"] if x["key"] == "k-c1"]

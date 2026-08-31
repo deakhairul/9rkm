@@ -1,0 +1,14 @@
+[Unit]
+Description=9RKM v2 Shadow Observer (no production mutation)
+After=network.target 9rkm.service
+
+[Service]
+Type=simple
+User=ubuntu
+Environment=ROUTER_DB=/home/ubuntu/.9router/db/data.sqlite
+ExecStart=/usr/bin/python3 /home/ubuntu/scripts/9rkm/rkm_shadow.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

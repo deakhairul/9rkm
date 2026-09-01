@@ -41,16 +41,20 @@ def log(msg):
 # ---------- provider identity: route prefix -> node id ----------
 
 def route_prefix_map(conn):
-    """Map route-prefix katalog (tokenrouter, occ, kr, ...) -> set node id provider."""
+    """Map route-prefix katalog (tokenrouter, occ, kr, ...) -> set node id provider.
+    Prefix hidup di providerConnections.data.providerSpecificData (per-key),
+    BUKAN di providerNodes.data."""
     m = {}
-    rows = conn.execute("SELECT id, data FROM providerNodes").fetchall()
-    import json as J
+    rows = conn.execute("SELECT provider, data FROM providerConnections").fetchall()
     for r in rows:
-        d = J.loads(r["data"]) if r["data"] else {}
+        try:
+            d = json.loads(r["data"]) if r["data"] else {}
+        except Exception:
+            continue
         psd = d.get("providerSpecificData") or {}
         pfx = (psd.get("prefix") or "").strip().lower()
         if pfx:
-            m.setdefault(pfx, set()).add(r["id"])
+            m.setdefault(pfx, set()).add((r["provider"] or "").lower())
     return m
 
 

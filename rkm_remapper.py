@@ -17,7 +17,7 @@ Perbedaan dari aa_rank.py legacy (ADR 0005):
      tidak menulis combos/settings apa pun.
 
 CLI:
-  --combos [--write]   remap 2 combo AA (default dry-run)
+  --combos [--write]   remap 1 combo AA (default dry-run)
   --vision [--write]   remap vision pool (default dry-run)
   --status             laporan eligibility + status vision aktual
 """
@@ -31,7 +31,6 @@ import rkm_state as R
 
 DB = os.environ.get("ROUTER_DB", "/home/ubuntu/.9router/db/data.sqlite")
 COMBO_INTEL = "Artificial-Analysis-Intelligence-Index"
-COMBO_AGENTIC = "Artificial-Analysis-Agentic-Index"
 
 
 def log(msg):
@@ -106,7 +105,7 @@ def status_report(conn):
     st_combo = R.get_engine(conn, R.ENG_COMBO)
     st_vision = R.get_engine(conn, R.ENG_VISION)
     combos = {}
-    for name in (COMBO_INTEL, COMBO_AGENTIC):
+    for name in (COMBO_INTEL,):
         row = conn.execute("SELECT models FROM combos WHERE name=?", (name,)).fetchone()
         import json as J
         combos[name] = len(J.loads(row["models"])) if row and row["models"] else 0

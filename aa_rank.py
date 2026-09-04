@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-aa_rank.py — sync 2 combo AA (Intelligence + Agentic) + Vision dari Data API v2/free
-Scope: Artificial-Analysis-Intelligence-Index & Artificial-Analysis-Agentic-Index + Vision-Adapter
+aa_rank.py — sync 1 combo AA (Intelligence) + Vision dari Data API v2/free
+Scope: Artificial-Analysis-Intelligence-Index + Vision-Adapter
 Source: https://artificialanalysis.ai/api/v2/language/models/free (x-api-key)
 Aturan: discover katalog 9Router, rank semua kandidat per provider, probe terbaik turun sampai 2xx, satu model/provider
 Jadwal: setiap siklus 5 jam fetch skor AA + katalog provider; cache AA hanya fallback saat fetch gagal
@@ -27,7 +27,11 @@ CACHE_DIR_CANDIDATES = [
     "/home/ubuntu/scripts/9rkm",
 ]
 COMBO_INTEL = "Artificial-Analysis-Intelligence-Index"
-COMBO_AGENTIC = "Artificial-Analysis-Agentic-Index"
+# Member WAJIB mandat Dea (2026-09-04): digabung ke combo TANPA probe,
+# dicatat di log tiap remap. Dilepas saat probe normal sudah meloloskan.
+# Alasan: terbukti hidup via traffic live (sukses 09:19-11:42 WIB 4 Sep),
+# probe gagal intermiten (429 kuota free-tier), bukan model mati.
+PINNED_MIDS = ["oc/muse-spark-1.3-contributor-free"]
 COMBO_VISION = "Vision-Adapter-AA-Vision"
 API_BASE = "https://artificialanalysis.ai/api/v2/language/models/free"
 
@@ -505,15 +509,13 @@ def filter_vision_native(conn, scored):
             log(f"[aa_rank] vision EXCLUDE {mid} probe={st}")
     return kept
 
-def build_vision_pool(conn, intel_map, agentic_map, alias):
+def build_vision_pool(conn, intel_map, alias):
     scored = []
     for mid in distinct_models(conn):
         label = alias.get(mid)
         if not label:
             continue
         score = intel_map.get(label)
-        if not isinstance(score, (int, float)):
-            score = agentic_map.get(label)
         if not isinstance(score, (int, float)):
             continue
         scored.append((mid, label, float(score)))
@@ -768,6 +770,32 @@ def do_fetch():
         log(f"[aa_rank] fetch fail {e}", file=sys.stderr)
         return 2
 
+COVERAGE_TOPK = 20
+COVERAGE_MIN_PCT = 70.0
+
+
+def _coverage_report(intel_map, intel_groups, probe_cache, topk=COVERAGE_TOPK):
+    """Cakupan label skor-top yang punya >=1 kandidat lolos probe.
+    Mencegah kasus Muse Spark 1.3: skor 61-62 absen dari combo tanpa peringatan."""
+    ranked = sorted(intel_map.items(), key=lambda kv: -kv[1])[:max(1, topk)]
+    label_mids = {}
+    for cands in (intel_groups or {}).values():
+        for cand in cands:
+            label_mids.setdefault(cand.get("label"), set()).add(cand.get("mid"))
+    missing = []
+    covered = 0
+    for label, score in ranked:
+        if any(probe_cache.get(m) == "ok" for m in label_mids.get(label, ())):
+            covered += 1
+        else:
+            missing.append({"label": label, "score": score,
+                            "reason": "no-probe-ok" if label in label_mids else "unmapped"})
+    n = len(ranked)
+    pct = round(covered / n * 100, 1) if n else 100.0
+    return {"topk": n, "covered": covered, "pct": pct,
+            "warn": pct < COVERAGE_MIN_PCT, "missing": missing[:10]}
+
+
 def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
     alias = load_alias()
     log(f"[aa_rank] REMAP alias {len(alias)} cache_fallback={use_cache} write={write} with_vision={with_vision} dry={dry}")
@@ -789,16 +817,12 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
         log(f"[aa_rank] AA fetch failed -> cache n={len(rows)} ver={ver}: {error}")
     by_name, _ = aa_indexes(rows)
     intel_map = {}
-    agentic_map = {}
     for name, row in by_name.items():
         evaluations = row.get("evaluations") or {}
         intel = evaluations.get("artificial_analysis_intelligence_index")
-        agentic = evaluations.get("artificial_analysis_agentic_index")
         if isinstance(intel, (int, float)):
             intel_map[name] = float(intel)
-        if isinstance(agentic, (int, float)):
-            agentic_map[name] = float(agentic)
-    log(f"[aa_rank] intel_map {len(intel_map)} agentic_map {len(agentic_map)} source={source}")
+    log(f"[aa_rank] intel_map {len(intel_map)} source={source}")
     conn, db_path = _open_conn()
     try:
         catalog = fetch_router_catalog(conn)
@@ -816,16 +840,10 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
     intel_groups, intel_unmatched = build_ranked_candidates(
         catalog, alias, rows,
         "artificial_analysis_intelligence_index",
-        "artificial_analysis_agentic_index",
+        None,
         active_prefixes,
     )
-    agentic_groups, agentic_unmatched = build_ranked_candidates(
-        catalog, alias, rows,
-        "artificial_analysis_agentic_index",
-        "artificial_analysis_intelligence_index",
-        active_prefixes,
-    )
-    log(f"[aa_rank] catalog {len(catalog)} active_prefixes {len(active_prefixes)} locked_skip {locked_skipped} candidates Intel {sum(map(len, intel_groups.values()))}/{len(intel_groups)} Agentic {sum(map(len, agentic_groups.values()))}/{len(agentic_groups)} unmatched {max(intel_unmatched, agentic_unmatched)}")
+    log(f"[aa_rank] catalog {len(catalog)} active_prefixes {len(active_prefixes)} locked_skip {locked_skipped} candidates Intel {sum(map(len, intel_groups.values()))}/{len(intel_groups)} unmatched {intel_unmatched}")
     api_key = router_key_via_db(conn)
     if not api_key:
         log("[aa_rank] no router API key -> no write", file=sys.stderr)
@@ -835,26 +853,34 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
     paid_unavailable = set()
     probe = lambda mid: probe_model(mid, api_key)
     intel_selected = select_working_candidates(intel_groups, probe, probe_cache, paid_unavailable=paid_unavailable)
-    agentic_selected = select_working_candidates(agentic_groups, probe, probe_cache, paid_unavailable=paid_unavailable)
     intel_sorted = [(item["mid"], item["label"], item["score"]) for item in intel_selected]
-    agentic_sorted = [(item["mid"], item["label"], item["score"]) for item in agentic_selected]
     intel_list = [item["mid"] for item in intel_selected]
-    agentic_list = [item["mid"] for item in agentic_selected]
-    log(f"[aa_rank] final Intel {len(intel_list)} Agentic {len(agentic_list)} probes {len(probe_cache)} (best active per provider)")
+    log(f"[aa_rank] final Intel {len(intel_list)} probes {len(probe_cache)} (best active per provider)")
+    _sel_score = {item["mid"]: item["score"] for item in intel_selected}
+    for pinned in PINNED_MIDS:
+        if pinned in intel_list:
+            continue
+        _pin_score = float(intel_map.get(alias.get(pinned, ""), -1.0))
+        _idx = next((i for i, m in enumerate(intel_list) if _sel_score.get(m, -1.0) < _pin_score),
+                    len(intel_list))
+        intel_list.insert(_idx, pinned)
+        log(f"[aa_rank] PINNED +{pinned} skor {_pin_score} posisi #{_idx + 1} (mandat Dea, tanpa probe — E2E combo tetap wajib hijau)")
+    coverage = _coverage_report(intel_map, intel_groups, probe_cache)
+    if coverage["warn"]:
+        log(f"[aa_rank] COVERAGE WARN top{coverage['topk']} {coverage['covered']}/{coverage['topk']} ({coverage['pct']}%) — label skor-top absen, cek missing", file=sys.stderr)
+        for m in coverage["missing"][:5]:
+            log(f"[aa_rank]   missing {m['score']:6.1f} {m['label']} ({m['reason']})", file=sys.stderr)
+    else:
+        log(f"[aa_rank] coverage top{coverage['topk']} {coverage['covered']}/{coverage['topk']} ({coverage['pct']}%) OK")
     log("\n[aa_rank] Intelligence sorted (target index, other index fallback):")
     for item in intel_selected:
-        tag = "free" if item["free"] else "paid"
-        fallback = "" if item["primary"] else " fallback-index"
-        log(f"  {item['score']:6.1f} [{tag:4}] {item['mid']:45} <- {item['label']}{fallback}")
-    log("\n[aa_rank] Agentic sorted (target index, other index fallback):")
-    for item in agentic_selected:
         tag = "free" if item["free"] else "paid"
         fallback = "" if item["primary"] else " fallback-index"
         log(f"  {item['score']:6.1f} [{tag:4}] {item['mid']:45} <- {item['label']}{fallback}")
     vision_pool = None
     if with_vision:
         try:
-            vision_pool = build_vision_pool(conn, intel_map, agentic_map, alias)
+            vision_pool = build_vision_pool(conn, intel_map, alias)
         except Exception as e:
             log(f"[aa_rank] vision pool fail {e}")
     if dry and not write:
@@ -870,7 +896,7 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
         log("\n[aa_rank] nothing to write (use --dry or --write)")
         conn.close()
         return 0
-    if not validate_selection(intel_selected, probe_cache) or not validate_selection(agentic_selected, probe_cache):
+    if not validate_selection(intel_selected, probe_cache):
         log("[aa_rank] ABORT invalid selection; keep DB", file=sys.stderr)
         conn.close()
         return 4
@@ -905,7 +931,7 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
         pass
     rollback_path = db_path + f".combo-rollback-{ts}.json"
     previous_rows = {}
-    for combo_name in (COMBO_INTEL, COMBO_AGENTIC):
+    for combo_name in (COMBO_INTEL,):
         row = cur.execute("SELECT models FROM combos WHERE name=?", (combo_name,)).fetchone()
         previous_rows[combo_name] = json.loads(row[0]) if row and row[0] else None
     pathlib.Path(rollback_path).write_text(json.dumps(previous_rows, indent=2), encoding="utf-8")
@@ -913,7 +939,7 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
     log(f"[aa_rank] combo rollback {rollback_path}")
     try:
         cur.execute("BEGIN IMMEDIATE")
-        expected = {COMBO_INTEL: intel_list, COMBO_AGENTIC: agentic_list}
+        expected = {COMBO_INTEL: intel_list}
         for name, lst in expected.items():
             cur.execute("UPDATE combos SET models = ? WHERE name = ?", (json.dumps(lst), name))
             if cur.rowcount == 0:
@@ -923,7 +949,7 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
             write_vision_adapter(conn, vision_pool)
         else:
             log("[aa_rank] vision unchanged")
-        remap_state = {"at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00","Z"), "source": source, "intel": len(intel_list), "agentic": len(agentic_list), "vision": len(vision_pool) if vision_pool else 0, "backup": bak, "rollback": rollback_path}
+        remap_state = {"at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00","Z"), "source": source, "intel": len(intel_list), "coverage": coverage, "vision": len(vision_pool) if vision_pool else 0, "backup": bak, "rollback": rollback_path}
         cur.execute("INSERT INTO kv(scope,key,value) VALUES(?,?,?) ON CONFLICT(scope,key) DO UPDATE SET value=excluded.value", (KV_REMAP_SCOPE, KV_REMAP_KEY, json.dumps(remap_state)))
         for name, lst in expected.items():
             row = cur.execute("SELECT models FROM combos WHERE name=?", (name,)).fetchone()
@@ -935,7 +961,7 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
         log(f"[aa_rank] transaction rollback: {error}", file=sys.stderr)
         conn.close()
         return 4
-    cur.execute("SELECT name, json_array_length(models) FROM combos WHERE name IN (?,?)", (COMBO_INTEL, COMBO_AGENTIC))
+    cur.execute("SELECT name, json_array_length(models) FROM combos WHERE name = ?", (COMBO_INTEL,))
     for row in cur.fetchall():
         log(f"[aa_rank] verify {row[0]} len={row[1]}")
     if vision_pool is not None:
@@ -945,7 +971,7 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
             log(f"[aa_rank] verify vision {d.get('capacityAdapter',{}).get('vision',{})}")
     try:
         import tg_notify
-        msg = f"<b>AA Rank</b> {source} sync {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} — Intel {len(intel_list)} Agentic {len(agentic_list)} ver={ver} src={source}"
+        msg = f"<b>AA Rank</b> {source} sync {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} — Intel {len(intel_list)} ver={ver} src={source}"
         if vision_pool is not None:
             msg += f" Vision {len(vision_pool)}"
         tg_notify.notify(msg)
@@ -1012,17 +1038,13 @@ def main():
             rows, ver, _, _ = fetch_api_all()
             log(f"[aa_rank] API total {len(rows)} ver={ver}")
             intel_map = {}
-            agentic_map = {}
             for r in rows:
                 name = r.get("name", "").strip()
                 ev = r.get("evaluations", {})
                 intel = ev.get("artificial_analysis_intelligence_index")
-                agentic = ev.get("artificial_analysis_agentic_index")
                 if isinstance(intel, (int, float)):
                     intel_map[name] = float(intel)
-                if isinstance(agentic, (int, float)):
-                    agentic_map[name] = float(agentic)
-            log(f"[aa_rank] intel_map {len(intel_map)} agentic_map {len(agentic_map)}")
+            log(f"[aa_rank] intel_map {len(intel_map)}")
         except RuntimeError as e:
             low = str(e).lower()
             if "429" in str(e) or "rate" in low:
@@ -1031,19 +1053,15 @@ def main():
                 if rows2:
                     rows, ver = rows2, ver2
                     intel_map = {}
-                    agentic_map = {}
                     for r in rows:
                         n = (r.get("name") or "").strip()
                         ev = r.get("evaluations") or {}
                         it = ev.get("artificial_analysis_intelligence_index")
-                        ag = ev.get("artificial_analysis_agentic_index")
                         if isinstance(it, (int, float)): intel_map[n] = float(it)
-                        if isinstance(ag, (int, float)): agentic_map[n] = float(ag)
-                    log(f"[aa_rank] fallback intel {len(intel_map)} agentic {len(agentic_map)}")
+                    log(f"[aa_rank] fallback intel {len(intel_map)}")
                 else:
                     log("[aa_rank] API 429 + no cache -> fallback distinct 50.0")
                     intel_map = {}
-                    agentic_map = {}
                     rows = []
                     ver = "cached"
                     for mid in distinct_models(conn):
@@ -1053,7 +1071,7 @@ def main():
                     log(f"[aa_rank] fallback intel_map {len(intel_map)} from distinct")
             else:
                 raise
-        vision_pool = build_vision_pool(conn, intel_map, agentic_map, alias)
+        vision_pool = build_vision_pool(conn, intel_map, alias)
         if dry and not write:
             log("\n[aa_rank] --dry --vision done (no DB write)")
             if vision_pool:
@@ -1103,20 +1121,16 @@ def main():
         else:
             raise
     intel_map = {}
-    agentic_map = {}
     by_name = {}
     for r in rows:
         name = r.get("name","").strip()
         ev = r.get("evaluations",{})
         intel = ev.get("artificial_analysis_intelligence_index")
-        agentic = ev.get("artificial_analysis_agentic_index")
         if name:
             by_name[name] = r
             if isinstance(intel, (int,float)):
                 intel_map[name] = float(intel)
-            if isinstance(agentic, (int,float)):
-                agentic_map[name] = float(agentic)
-    log(f"[aa_rank] intel_map {len(intel_map)} agentic_map {len(agentic_map)}")
+    log(f"[aa_rank] intel_map {len(intel_map)}")
     conn, db_path = _open_conn()
     distinct = distinct_models(conn)
     log(f"[aa_rank] distinct models {len(distinct)}")
@@ -1134,30 +1148,22 @@ def main():
                     continue
             scored.append((mid, label, float(score)))
         return scored
-    intel_scored = build_scored(intel_map, agentic_map)
-    agentic_scored = build_scored(agentic_map, intel_map)
-    log(f"[aa_rank] scored Intel {len(intel_scored)} Agentic {len(agentic_scored)} (before probe)")
+    intel_scored = build_scored(intel_map)
+    log(f"[aa_rank] scored Intel {len(intel_scored)} (before probe)")
     intel_probed = filter_active_and_probe(conn, intel_scored)
-    agentic_probed = filter_active_and_probe(conn, agentic_scored)
-    log(f"[aa_rank] probed Intel {len(intel_probed)} Agentic {len(agentic_probed)} (pass=[ok,rate])")
+    log(f"[aa_rank] probed Intel {len(intel_probed)} (pass=[ok,rate])")
     intel_sorted = dedup_by_provider(intel_probed)
-    agentic_sorted = dedup_by_provider(agentic_probed)
-    log(f"[aa_rank] dedup Intel {len(intel_sorted)} Agentic {len(agentic_sorted)} (keep max score among pass)")
+    log(f"[aa_rank] dedup Intel {len(intel_sorted)} (keep max score among pass)")
     intel_list = [mid for mid, _, _ in intel_sorted]
-    agentic_list = [mid for mid, _, _ in agentic_sorted]
-    log(f"[aa_rank] final Intel {len(intel_list)} Agentic {len(agentic_list)} (union fallback MAX, pure AA -score tie free)")
+    log(f"[aa_rank] final Intel {len(intel_list)} (pure AA -score tie free)")
     log("\n[aa_rank] Intelligence sorted (pure AA -score tie free, 1/provider):")
     for mid, label, score in intel_sorted:
-        tag = "free" if is_free(mid) else "paid"
-        log(f"  {score:6.1f} [{tag:4}] {mid:45} <- {label}")
-    log("\n[aa_rank] Agentic sorted (pure AA -score tie free, 1/provider):")
-    for mid, label, score in agentic_sorted:
         tag = "free" if is_free(mid) else "paid"
         log(f"  {score:6.1f} [{tag:4}] {mid:45} <- {label}")
     vision_pool = None
     if vision_with_combos:
         try:
-            vision_pool = build_vision_pool(conn, intel_map, agentic_map, alias)
+            vision_pool = build_vision_pool(conn, intel_map, alias)
         except Exception as e:
             log(f"[aa_rank] vision pool fail {e}")
     if dry and not write:
@@ -1184,20 +1190,12 @@ def main():
     cur = conn.cursor()
     # GUARD: jangan tulis combo kosong — pakai DB lama (fallback database)
     prev_intel = None
-    prev_agentic = None
     prev_vision = None
     try:
         cur.execute("SELECT models FROM combos WHERE name=?", (COMBO_INTEL,))
         r = cur.fetchone()
         if r and r[0]:
             prev_intel = json.loads(r[0])
-    except Exception:
-        pass
-    try:
-        cur.execute("SELECT models FROM combos WHERE name=?", (COMBO_AGENTIC,))
-        r = cur.fetchone()
-        if r and r[0]:
-            prev_agentic = json.loads(r[0])
     except Exception:
         pass
     try:
@@ -1214,15 +1212,8 @@ def main():
             intel_sorted = [(m, alias.get(m, m), 0) for m in intel_list]  # placeholder for logging
         else:
             log(f"[aa_rank] ABORT Intel empty and no prev -> no write", file=sys.stderr)
-    if not agentic_list:
-        log(f"[aa_rank] GUARD skip write {COMBO_AGENTIC} empty -> keep DB {len(prev_agentic) if prev_agentic else 0}")
-        if prev_agentic is not None:
-            agentic_list = prev_agentic
-            agentic_sorted = [(m, alias.get(m, m), 0) for m in agentic_list]
-        else:
-            log(f"[aa_rank] ABORT Agentic empty and no prev -> no write", file=sys.stderr)
     # hanya tulis jika ada isinya
-    for name, lst in [(COMBO_INTEL, intel_list), (COMBO_AGENTIC, agentic_list)]:
+    for name, lst in [(COMBO_INTEL, intel_list)]:
         if not lst:
             log(f"[aa_rank] SKIP write {name} empty")
             continue
@@ -1238,7 +1229,7 @@ def main():
     else:
         log(f"[aa_rank] vision_pool None -> skip")
     conn.commit()
-    cur.execute("SELECT name, json_array_length(models) FROM combos WHERE name IN (?,?)", (COMBO_INTEL, COMBO_AGENTIC))
+    cur.execute("SELECT name, json_array_length(models) FROM combos WHERE name = ?", (COMBO_INTEL,))
     for row in cur.fetchall():
         log(f"[aa_rank] verify {row[0]} len={row[1]}")
     if vision_pool is not None:
@@ -1248,7 +1239,7 @@ def main():
             log(f"[aa_rank] verify vision {d.get('capacityAdapter',{}).get('vision',{})}")
     try:
         import tg_notify
-        msg = f"<b>AA Rank</b> API v2/free sync {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} — Intel {len(intel_list)} Agentic {len(agentic_list)} pureAA 1/provider ver={ver}"
+        msg = f"<b>AA Rank</b> API v2/free sync {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} — Intel {len(intel_list)} pureAA 1/provider ver={ver}"
         if vision_pool is not None:
             msg += f" Vision {len(vision_pool)}"
         tg_notify.notify(msg)

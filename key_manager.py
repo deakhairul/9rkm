@@ -32,7 +32,7 @@ REMAP_LOG = "/tmp/aa_remap_last.log"
 REMAP_PROBING = threading.Event()
 REMAP_CYCLE_SCOPE = "aa_remap_cycle"
 REMAP_CYCLE_KEY = "state"
-COMBO_NAMES = ("Artificial-Analysis-Intelligence-Index", "Artificial-Analysis-Agentic-Index")
+COMBO_NAMES = ("Artificial-Analysis-Intelligence-Index",)
 EC_HINT = {400: "Request salah", 401: "Kunci salah/expired", 402: "Saldo habis", 403: "Akses ditolak", 429: "Kuota habis"}
 
 def _hint(ec):
@@ -145,7 +145,7 @@ def _release_remap_lock(descriptor):
     os.close(descriptor)
 
 def _remap_snapshot(cursor):
-    out = {"lastAt": None, "lastWib": None, "source": None, "intel": None, "agentic": None, "vision": None, "cacheAt": None, "cacheAgeH": None, "locked": False, "cooldownSec": 0}
+    out = {"lastAt": None, "lastWib": None, "source": None, "intel": None, "coverage": None, "vision": None, "cacheAt": None, "cacheAgeH": None, "locked": False, "cooldownSec": 0}
     try:
         cursor.execute("SELECT value FROM kv WHERE scope=? AND key=?", ("aa_cache", "state"))
         r = cursor.fetchone()
@@ -170,8 +170,8 @@ def _remap_snapshot(cursor):
             out["lastAt"] = j.get("at")
             out["source"] = j.get("source")
             out["intel"] = j.get("intel")
-            out["agentic"] = j.get("agentic")
             out["vision"] = j.get("vision")
+            out["coverage"] = j.get("coverage")
             if j.get("at"):
                 try:
                     dt = datetime.datetime.fromisoformat(j["at"].replace("Z","+00:00"))
@@ -225,14 +225,31 @@ def _probe_combo(name):
         conn.close()
     if not api_key:
         return False
-    payload = json.dumps({"model": name, "messages": [{"role": "user", "content": "Reply PONG only"}], "max_tokens": 64, "stream": False}).encode()
-    request = urllib.request.Request("http://127.0.0.1:20128/v1/chat/completions", data=payload, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+    payload = json.dumps({"model": name, "messages": [{"role": "user", "content": "Reply PONG only"}], "max_tokens": 64, "stream": True}).encode()
+    request = urllib.request.Request("http://127.0.0.1:20128/v1/chat/completions", data=payload, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "Accept": "text/event-stream"})
     try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            response.read()
-            return 200 <= response.status < 300
+        with urllib.request.urlopen(request, timeout=600) as response:
+            if not (200 <= response.status < 300):
+                return False
+            raw = response.read().decode("utf-8", errors="replace")
+    # NOTE: timeout 600s — combo 17 fallback berurutan butuh waktu; E2E boleh lambat asal 2xx+konten.
     except Exception:
         return False
+    # SSE stream: first content-bearing data chunk decides (responses-kind
+    # models return empty body with stream:false, so stream:true is required).
+    if "data:" in raw:
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if not data or data == "[DONE]":
+                continue
+            if "error" in data and "delta" not in data and "choices" not in data:
+                return False
+            return True
+        return False
+    return '"choices"' in raw and '"error"' not in raw[:500]
 
 def _cycle_state():
     conn = get_db()
@@ -253,6 +270,24 @@ def _restart_router():
     result = subprocess.run(["pm2", "restart", "9router"], capture_output=True, text=True, timeout=30)
     return result.returncode == 0
 
+def _wait_router_ready(timeout=180):
+    """Poll /api/health sampai 200 — 9Router butuh waktu boot sesudah restart;
+    tanpa ini E2E menembak server yang belum siap (false-fail + rollback sia-sia)."""
+    import urllib.request
+    deadline = time.time() + timeout
+    last = "n/a"
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:20128/api/health", timeout=10) as r:
+                if 200 <= r.status < 300:
+                    return True
+                last = f"http={r.status}"
+        except Exception as e:
+            last = f"{type(e).__name__}"
+        time.sleep(5)
+    log(f"[Remap] router not ready after {timeout}s (last={last})")
+    return False
+
 def _run_remap(force=False):
     cycle_id = get_cycle_id()
     if not force and _cycle_state().get("successCycle") == cycle_id:
@@ -260,7 +295,7 @@ def _run_remap(force=False):
     enabled, _ = get_toggle()
     if not enabled:
         log("[Remap] skip (toggle OFF)")
-        return 0
+        return 3
     descriptor = _acquire_remap_lock()
     if descriptor is None:
         log("[Remap] locked skip")
@@ -284,6 +319,8 @@ def _run_remap(force=False):
             raise RuntimeError(f"aa_rank exit {result.returncode}")
         if not _restart_router():
             raise RuntimeError("pm2 restart failed")
+        if not _wait_router_ready():
+            raise RuntimeError("router not ready after restart")
         if not all(_probe_combo(name) for name in COMBO_NAMES):
             raise RuntimeError("combo E2E failed")
         _, _, reset_status = run_reset()
@@ -664,13 +701,24 @@ def run_reset():
             pass
 
 def reset_cycle_thread():
+    fails = 0
     while True:
         current = get_cycle_id()
         enabled, _ = get_toggle()
         if enabled and _cycle_state().get("successCycle") != current:
             code = _run_remap()
-            time.sleep(300 if code else 30)
+            if code == 5:
+                time.sleep(30)
+            elif code:
+                fails += 1
+                if fails == 3:
+                    notify("Remap gagal 3x beruntun — backoff eksponensial aktif, cek coverage/E2E di /api/status.")
+                time.sleep(min(300 * (2 ** min(fails - 1, 3)), 3600))
+            else:
+                fails = 0
+                time.sleep(30)
         else:
+            fails = 0
             time.sleep(30)
 
 # ---------- Status snapshot (dipakai TG + Web) ----------
@@ -951,6 +999,63 @@ class RkmHandler(http.server.BaseHTTPRequestHandler):
                     pass
             _run_remap_async(force=force)
             self._json(202, {"ok": True, "force": force, "msg": "remap started"})
+            return
+        if self.path.startswith("/api/alias/proposal"):
+            try:
+                r = subprocess.run([sys.executable, os.path.join(UI_PATH, "alias_sync.py")],
+                                   capture_output=True, text=True, timeout=180)
+                tail = ((r.stdout or "") + (r.stderr or ""))[-2000:]
+                try:
+                    prop = json.loads(pathlib.Path(os.path.join(UI_PATH, "alias_proposal.json")).read_text(encoding="utf-8"))
+                except Exception as e:
+                    self._json(500, {"error": f"proposal unreadable: {e}", "log": tail})
+                    return
+                prop["_sync_rc"] = r.returncode
+                prop["_sync_log"] = tail[-1000:]
+                self._json(200, prop)
+            except Exception as e:
+                self._json(500, {"error": str(e)})
+            return
+        if self.path.startswith("/api/alias/approve"):
+            try:
+                ln = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(ln).decode()) if ln else {}
+            except Exception:
+                self._json(400, {"error": "bad json"})
+                return
+            add = body.get("add") or {}
+            remove = body.get("remove") or []
+            if not isinstance(add, dict) or not isinstance(remove, list):
+                self._json(400, {"error": "need {add:{mid:label}, remove:[mid]}"})
+                return
+            try:
+                import datetime as _dt
+                alias_path = os.path.join(UI_PATH, "aa_alias.json")
+                cache_path = os.path.join(UI_PATH, "aa_cache.json")
+                rows = json.loads(pathlib.Path(cache_path).read_text(encoding="utf-8")).get("data", [])
+                names = {(r.get("name") or "").strip() for r in rows}
+                for mid, label in add.items():
+                    if not isinstance(mid, str) or "/" not in mid or not isinstance(label, str) or not label.strip():
+                        self._json(400, {"error": f"bad mapping {mid!r}"})
+                        return
+                    if label.strip() not in names:
+                        self._json(400, {"error": f"label unknown di API: {label}"})
+                        return
+                alias = json.loads(pathlib.Path(alias_path).read_text(encoding="utf-8")) if os.path.exists(alias_path) else {}
+                ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+                bak = alias_path + f".bak-approve-{ts}"
+                pathlib.Path(bak).write_text(json.dumps(alias, indent=1, ensure_ascii=False), encoding="utf-8")
+                os.chmod(bak, 0o600)
+                for mid in remove:
+                    alias.pop(mid, None)
+                for mid, label in add.items():
+                    alias[mid.strip()] = label.strip()
+                pathlib.Path(alias_path).write_text(json.dumps(alias, indent=1, ensure_ascii=False), encoding="utf-8")
+                os.chmod(alias_path, 0o600)
+                log(f"[WebUI] alias approve +{len(add)} -{len(remove)} bak={os.path.basename(bak)}.")
+                self._json(200, {"ok": True, "alias_count": len(alias), "added": len(add), "removed": len(remove)})
+            except Exception as e:
+                self._json(500, {"error": str(e)})
             return
         if self.path.startswith("/api/toggle"):
             try:

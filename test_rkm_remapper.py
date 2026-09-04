@@ -25,7 +25,6 @@ def main():
     CREATE TABLE settings(id INTEGER PRIMARY KEY, data TEXT);
     CREATE TABLE kv(scope TEXT, key TEXT, value TEXT, PRIMARY KEY(scope,key));
     INSERT INTO combos VALUES('Artificial-Analysis-Intelligence-Index','["a/b"]');
-    INSERT INTO combos VALUES('Artificial-Analysis-Agentic-Index','["c/d"]');
     INSERT INTO settings VALUES(1, json('{"capacityAdapter":{"vision":{"models":["x/y","z/w"]}}}'));
     """)
     # node eligible + key (ON, Unknown) + satu key OFF (harus tetap masuk discovery)
@@ -46,7 +45,7 @@ def main():
     rep = M.status_report(conn)
     assert rep["vision"]["count"] == 2, rep["vision"]
     assert rep["vision"]["pool"] == ["x/y", "z/w"]
-    assert rep["combos_now"] == {M.COMBO_INTEL: 1, M.COMBO_AGENTIC: 1}
+    assert rep["combos_now"] == {M.COMBO_INTEL: 1}
     assert rep["providers_eligible"] >= 1, rep  # fail-open unknown
     # 2) dry-run combos tidak boleh menyentuh DB (butuh network -> cukup assert tidak
     #    menulis: jalankan dengan catalog gagal pun harus returncode != crash total;

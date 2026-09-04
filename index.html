@@ -86,6 +86,16 @@
     <div class="log" id="log"></div>
   </div>
 
+  <div class="card">
+    <div style="font-size:14px;font-weight:700">Alias AA (anti label-baru-gugur)</div>
+    <div class="log">Bandingkan label skor-top API vs alias + katalog. Penerapan per-item, backup otomatis.</div>
+    <div class="bulk-row">
+      <button class="btn bulk remap" id="bAliasCheck">\U0001f50d Cek alias</button>
+    </div>
+    <div class="log" id="aliaslog"></div>
+    <table id="tblAlias"><tr><th>Tipe</th><th>Label</th><th>Mid</th><th>Skor/Alasan</th><th>Conf</th><th>Aksi</th></tr></table>
+  </div>
+
   <dialog id="dlgOff"><form method="dialog"><div style="font-weight:700;color:var(--bad)">DEACTIVATE ALL KEY?</div><div class="log" style="margin:6px 0">Semua key akan OFF. Siklus berikutnya menyalakan semua kembali; key yang masih error akan OFF lagi otomatis. Ketik <b>OFF</b> untuk konfirmasi.</div><input id="dlgOffInput" placeholder="OFF" autocomplete="off"><div class="row" style="margin-top:10px"><button value="cancel" class="btn" style="flex:1">Batal</button><button id="dlgOffOk" value="ok" class="btn off" style="flex:1">DEACTIVATE</button></div></form></dialog>
   <dialog id="dlgOn"><form method="dialog"><div style="font-weight:700;color:var(--ok)">ACTIVATE ALL KEY?</div><div class="log" style="margin:6px 0">Semua key akan diaktifkan &amp; dibersihkan error.</div><div class="row" style="margin-top:10px"><button value="cancel" class="btn" style="flex:1">Batal</button><button value="ok" class="btn on" style="flex:1">ACTIVATE</button></div></form></dialog>
   <div class="card" id="retiredCard" style="display:none">
@@ -186,7 +196,7 @@ function renderRemap(s){
   let txt='';
   if(r.locked) txt+='⏳ remap sedang jalan… ';
   if(r.cooldownSec>0) txt+=`cooldown ${Math.ceil(r.cooldownSec/60)}m `;
-  if(r.lastWib) txt+=`last ${r.lastWib} src=${r.source||'-'} Intel ${r.intel??'-'} Agentic ${r.agentic??'-'} Vision ${r.vision??'-'} | cache ${r.cacheAgeH!=null?r.cacheAgeH+'j':'-'} `;
+  if(r.lastWib) txt+=`last ${r.lastWib} src=${r.source||'-'} Intel ${r.intel??'-'} Vision ${r.vision??'-'} | cache ${r.cacheAgeH!=null?r.cacheAgeH+'j':'-'} `+(r.coverage?`Cov ${r.coverage.pct}%${r.coverage.warn?' \u26a0':''} `:'');
   else if(r.cacheAt) txt+=`cache ${r.cacheAgeH}j `;
   el.textContent=txt;
   const btn=document.getElementById('bRemap');
@@ -229,6 +239,53 @@ $('bOff').onclick = () => toggle(false);
 $('bBulkOn').onclick = () => $('dlgOn').showModal();
 const _bRemap=document.getElementById('bRemap'); if(_bRemap) _bRemap.onclick=()=>{ const force=confirm('Force = tarik API 1x dulu (jika 429 fallback DB). OK=force, Cancel=pakai cache DB langsung'); doRemap(force); };
 $('bBulkOff').onclick = () => {$('dlgOffInput').value='';$('dlgOff').showModal();};
+$('bAliasCheck').onclick = aliasCheck;
+async function aliasCheck(){
+  const el=document.getElementById('aliaslog');
+  el.textContent='\u23f3 cek alias…';
+  try{ renderAlias(await api('/api/alias/proposal')); }
+  catch(e){ el.textContent='Gagal: '+e.message; }
+}
+function aliasRow(cells, btnLabel, onClick){
+  const tb=document.getElementById('tblAlias');
+  const tr=tb.insertRow();
+  cells.forEach(c=>{tr.insertCell().textContent=c;});
+  const td=tr.insertCell();
+  if(btnLabel){ const b=document.createElement('button'); b.className='btn remap'; b.style.padding='6px 10px'; b.style.fontSize='12px'; b.textContent=btnLabel; b.onclick=onClick; td.appendChild(b); }
+}
+function renderAlias(p){
+  const el=document.getElementById('aliaslog');
+  if(!p||!p.unmapped){ el.textContent='—'; return; }
+  el.textContent='alias='+p.alias_count+' unmapped_top'+p.topk+'='+p.unmapped.length+' stale='+p.stale.length+' superseded='+p.superseded.length+' @ '+(p.at||'-');
+  const tb=document.getElementById('tblAlias');
+  while(tb.rows.length>1) tb.deleteRow(1);
+  (p.unmapped||[]).forEach(u=>{
+    aliasRow(['baru', u.label, u.suggest_mid||'(tanpa saran)', String(u.score), (u.confidence??'-')], u.suggest_mid?'\u2713 pakai':'', async ()=>{
+      if(!confirm('Tambah alias '+u.suggest_mid+' → '+u.label+'?')) return;
+      await aliasApprove({add:{[u.suggest_mid]:u.label}, remove:[]});
+    });
+  });
+  (p.superseded||[]).forEach(s=>{
+    aliasRow(['ganti versi', s.from+' → '+s.to, s.mid, '', ''], '\u2713 ganti', async ()=>{
+      if(!confirm('Ganti '+s.mid+': '+s.from+' → '+s.to+'?')) return;
+      await aliasApprove({add:{[s.mid]:s.to}, remove:[]});
+    });
+  });
+  (p.stale||[]).forEach(s=>{
+    aliasRow(['basi', s.label, s.mid, s.reason, ''], '\U0001f5d1 hapus', async ()=>{
+      if(!confirm('Hapus alias '+s.mid+'?')) return;
+      await aliasApprove({add:{}, remove:[s.mid]});
+    });
+  });
+}
+async function aliasApprove(body){
+  const el=document.getElementById('aliaslog');
+  try{
+    const r=await api('/api/alias/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    el.textContent='OK: +'+r.added+' -'+r.removed+' (alias='+r.alias_count+'). Cek ulang untuk proposal baru.';
+    await aliasCheck();
+  }catch(e){ el.textContent='Gagal approve: '+e.message; }
+}
 $('dlgOn').addEventListener('close',()=>{if($('dlgOn').returnValue==='ok')bulk('on')});
 $('dlgOff').addEventListener('close',()=>{if($('dlgOff').returnValue==='ok' && $('dlgOffInput').value.trim()==='OFF')bulk('off');else if($('dlgOff').returnValue==='ok')$('bulklog').textContent='Batal: ketik OFF tidak cocok';});
 $('dlgOffInput').addEventListener('input',()=>{$('dlgOffOk').disabled=$('dlgOffInput').value.trim()!=='OFF'});

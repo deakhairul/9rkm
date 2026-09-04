@@ -10,7 +10,8 @@ Supporting tooling for a self-hosted [9Router](https://www.npmjs.com/package/dec
 |---|---|
 | `key_manager.py` | **9RKM** — key-manager daemon: 5s error scan → auto-OFF, 5-hour remap cycle (reset keys after successful E2E), Web UI |
 | `aa_rank.py` | Discovers every active provider catalog, ranks candidates by Artificial Analysis, probes best-to-worst until one works, then writes one model/provider/combo |
-| `9rkm-index.html` | 9RKM Web UI (dark theme, single file, no build step) |
+| `aa_alias.json` | Label map AA → model id (version-pinned); maintenance proposals via `alias_sync.py` + Web UI approve |
+| `index.html` | 9RKM Web UI (dark theme, single file, no build step) |
 | `9rkm.service` | systemd unit for the daemon |
 | `bot_hub.py` | **Bot Hub** — single poller for multiple Telegram bots, HTTP-dispatches updates to each project (avoids Telegram 409 conflicts) |
 | `bot-hub-registry.example.json` | Registry template: bot → patterns → HTTP target |

@@ -217,7 +217,10 @@ def _lifecycle_env():
 
 def _fresh_ts():
     # error fresh relatif waktu sekarang (mencegah test basi saat tanggal lewat window 1 jam)
-    return _datetime.datetime.now(_datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + "000Z"
+    # Presisi ms wajib: format detik-bulat ("000Z") membuat err_ts < success_ts artifisial
+    # sehingga candidates_from_error_code mengira sukses-lebih-baru dan tes jadi flaky
+    # (lolos hanya bila sleep 0.25s melintasi batas detik).
+    return _datetime.datetime.now(_datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 def _mk_conn(db, cid, active=1, error=None, err_at=None):

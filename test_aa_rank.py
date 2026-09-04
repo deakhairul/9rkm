@@ -491,6 +491,15 @@ def test_stream_ok_plain_choices():
     assert key_manager._stream_ok('{"error": "nope", "choices": []}') is False
 
 
+def test_scan_cap_defers_overflow_to_next_ticks():
+    cands = [{"connectionId": f"c{i}"} for i in range(25)]
+    kept = key_manager._cap_candidates(cands)
+    assert len(kept) == key_manager.SCAN_MAX_OFF_PER_TICK
+    assert [c["connectionId"] for c in kept] == [f"c{i}" for i in range(key_manager.SCAN_MAX_OFF_PER_TICK)]
+    small = [{"connectionId": "a"}]
+    assert key_manager._cap_candidates(small) == small
+
+
 if __name__ == "__main__":
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:

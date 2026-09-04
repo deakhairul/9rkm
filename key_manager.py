@@ -342,6 +342,7 @@ def _run_remap(force=False):
         log("[Remap] locked skip")
         return 5
     snapshot = None
+    output = ""
     try:
         REMAP_PROBING.set()
         snapshot = _combo_snapshot()
@@ -351,11 +352,10 @@ def _run_remap(force=False):
             ["/usr/bin/python3", "/home/ubuntu/scripts/9rkm/aa_rank.py", "--remap", "--no-vision"],
             capture_output=True,
             text=True,
-            timeout=1200,
+            timeout=1800,
             env=child_env,
         )
         output = (result.stdout or "")[-16000:] + (result.stderr or "")[-4000:]
-        pathlib.Path(REMAP_LOG).write_text(output, encoding="utf-8")
         if result.returncode != 0:
             raise RuntimeError(f"aa_rank exit {result.returncode}")
         if not _restart_router():
@@ -385,6 +385,11 @@ def _run_remap(force=False):
         _save_cycle_state({"successCycle": _cycle_state().get("successCycle"), "attemptCycle": cycle_id, "at": get_iso_now(), "status": f"error:{error}"})
         return 4
     finally:
+        try:
+            if output:
+                pathlib.Path(REMAP_LOG).write_text(output, encoding="utf-8")
+        except Exception as log_error:
+            log(f"[Remap] tulis log gagal {log_error}")
         REMAP_PROBING.clear()
         _release_remap_lock(descriptor)
 
@@ -491,6 +496,16 @@ def candidates_from_error_code(active_map, requests_by_conn, cutoff_iso, bulk_at
         })
     return found
 
+SCAN_MAX_OFF_PER_TICK = 10
+
+
+def _cap_candidates(candidates, limit=SCAN_MAX_OFF_PER_TICK):
+    if len(candidates) > limit:
+        log(f"[Auto-OFF 5s] breaker: {len(candidates)} kandidat > batas {limit}/tick — sisa ditunda tick berikut.")
+        return candidates[:limit]
+    return candidates
+
+
 def run_scan_tick():
     if REMAP_PROBING.is_set():
         return 0, "remap-probing"
@@ -566,7 +581,9 @@ def run_scan_tick():
                         state[cid].pop("counted_cycle_id", None)
                         state[cid].pop("auto_off_ts", None)
 
-        candidates = candidates_from_error_code(active_map, requests_by_conn, cutoff_iso, bulk_at_iso, bulk_grace_iso)
+        candidates = _cap_candidates(
+            candidates_from_error_code(active_map, requests_by_conn, cutoff_iso, bulk_at_iso, bulk_grace_iso)
+        )
 
         if not candidates:
             save_state_to_db(cursor, state)

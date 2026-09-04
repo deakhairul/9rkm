@@ -426,6 +426,34 @@ def test_lifecycle_active_problem_shows_S():
         _shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_slug_top20_requires_explicit_alias():
+    rows = [row("Top Model", "top-model", 99, 90), row("Low Model", "low-model", 10, 9)]
+    catalog = [
+        {"id": "vendor/top-model", "owned_by": "vendor"},
+        {"id": "vendor/low-model", "owned_by": "vendor"},
+    ]
+    groups, unmatched = aa_rank.build_ranked_candidates(
+        catalog, {}, rows, INTEL, AGENTIC, {"vendor"}, {"Top Model"})
+    assert unmatched == 1
+    assert [item["mid"] for item in groups["vendor"]] == ["vendor/low-model"]
+
+
+def test_slug_outside_top20_still_allowed():
+    rows = [row("Top Model", "top-model", 99, 90), row("Low Model", "low-model", 10, 9)]
+    catalog = [
+        {"id": "vendor/top-model", "owned_by": "vendor"},
+        {"id": "vendor/low-model", "owned_by": "vendor"},
+    ]
+    groups, unmatched = aa_rank.build_ranked_candidates(
+        catalog, {}, rows, INTEL, AGENTIC, {"vendor"}, {"Top Model", "Other"})
+    assert unmatched == 1
+    aliases = {"vendor/top-model": "Top Model"}
+    groups2, unmatched2 = aa_rank.build_ranked_candidates(
+        catalog, aliases, rows, INTEL, AGENTIC, {"vendor"}, {"Top Model"})
+    assert unmatched2 == 0
+    assert [item["mid"] for item in groups2["vendor"]] == ["vendor/top-model", "vendor/low-model"]
+
+
 if __name__ == "__main__":
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:

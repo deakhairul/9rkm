@@ -221,8 +221,10 @@ def resolve_aa_row(mid, aliases, by_name, by_slug):
             return by_slug[candidate]
     return None
 
-def build_ranked_candidates(catalog, aliases, rows, target_key, fallback_key, active_prefixes=None):
+def build_ranked_candidates(catalog, aliases, rows, target_key, fallback_key, active_prefixes=None,
+                            alias_only_labels=None):
     by_name, by_slug = aa_indexes(rows)
+    alias_only = set(alias_only_labels or ())
     groups = {}
     unmatched = 0
     for model in catalog:
@@ -234,6 +236,9 @@ def build_ranked_candidates(catalog, aliases, rows, target_key, fallback_key, ac
             continue
         row = resolve_aa_row(mid, aliases, by_name, by_slug)
         if not row:
+            unmatched += 1
+            continue
+        if mid not in aliases and (row.get("name") or "") in alias_only:
             unmatched += 1
             continue
         evaluations = row.get("evaluations") or {}
@@ -837,11 +842,13 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
         conn.close()
         return 4
     catalog, locked_skipped = filter_catalog_by_locks(catalog, inventory)
+    top_labels = {name for name, _ in sorted(intel_map.items(), key=lambda kv: -kv[1])[:COVERAGE_TOPK]}
     intel_groups, intel_unmatched = build_ranked_candidates(
         catalog, alias, rows,
         "artificial_analysis_intelligence_index",
         None,
         active_prefixes,
+        top_labels,
     )
     log(f"[aa_rank] catalog {len(catalog)} active_prefixes {len(active_prefixes)} locked_skip {locked_skipped} candidates Intel {sum(map(len, intel_groups.values()))}/{len(intel_groups)} unmatched {intel_unmatched}")
     api_key = router_key_via_db(conn)

@@ -500,6 +500,31 @@ def test_scan_cap_defers_overflow_to_next_ticks():
     assert key_manager._cap_candidates(small) == small
 
 
+def test_rollback_marks_visible_state_truthful():
+    km, db, tmp = _lifecycle_env()
+    try:
+        conn = _sqlite3.connect(db)
+        conn.execute("INSERT INTO combos VALUES('Artificial-Analysis-Intelligence-Index', ?)",
+                     (_json.dumps(["a/x", "b/y"]),))
+        conn.execute("INSERT INTO kv VALUES('aa_remap', 'state', ?)",
+                     (_json.dumps({"at": "lama", "source": "api", "intel": 99, "coverage": {}, "vision": 5}),))
+        conn.commit()
+        conn.close()
+        km._mark_remap_rolled_back("uji-gagal")
+        conn = _sqlite3.connect(db)
+        row = conn.execute("SELECT value FROM kv WHERE scope='aa_remap' AND key='state'").fetchone()
+        conn.close()
+        st = _json.loads(row[0])
+        assert st["source"].startswith("rollback:")
+        assert st["intel"] == 2
+        assert st["vision"] == 5
+        assert st["rollback"] is True
+    finally:
+        _os.environ.pop("ROUTER_DB", None)
+        import shutil as _shutil
+        _shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:

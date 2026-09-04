@@ -27,11 +27,11 @@ CACHE_DIR_CANDIDATES = [
     "/home/ubuntu/scripts/9rkm",
 ]
 COMBO_INTEL = "Artificial-Analysis-Intelligence-Index"
-# Member WAJIB mandat Dea (2026-09-04): digabung ke combo TANPA probe,
-# dicatat di log tiap remap. Dilepas saat probe normal sudah meloloskan.
-# Alasan: terbukti hidup via traffic live (sukses 09:19-11:42 WIB 4 Sep),
-# probe gagal intermiten (429 kuota free-tier), bukan model mati.
-PINNED_MIDS = ["oc/muse-spark-1.3-contributor-free"]
+# Member WAJIB mandat Dea — DICABUT 2026-09-04 malam (keputusan Dea):
+# combo wajib 100% hasil remap sesuai AA INDEX dan aktif; pin tanpa-probe
+# melanggarnya (E2E-pertama 429 → rollback tiap remap). 1.3 kembali OTOMATIS
+# saat probe normal meloloskan (alias oc→1.3-max tetap ada).
+PINNED_MIDS = []
 COMBO_VISION = "Vision-Adapter-AA-Vision"
 API_BASE = "https://artificialanalysis.ai/api/v2/language/models/free"
 

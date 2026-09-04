@@ -260,6 +260,43 @@ def _probe_combo(name):
     return _stream_ok(raw)
 
 
+def _mark_remap_rolled_back(reason):
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM kv WHERE scope=? AND key=?", ("aa_remap", "state"))
+        row = cur.fetchone()
+        prev = {}
+        if row and row[0]:
+            try:
+                prev = json.loads(row[0])
+            except Exception:
+                prev = {}
+        n = 0
+        for name in COMBO_NAMES:
+            r = cur.execute("SELECT models FROM combos WHERE name=?", (name,)).fetchone()
+            if r and r[0]:
+                try:
+                    arr = json.loads(r[0])
+                    if isinstance(arr, list):
+                        n = len(arr)
+                except Exception:
+                    pass
+        state = {"at": get_iso_now(), "source": "rollback:" + str(reason)[:60],
+                 "intel": n, "coverage": {"topk": 0, "covered": 0, "pct": 0.0, "warn": True, "missing": []},
+                 "vision": prev.get("vision"), "backup": prev.get("backup"), "rollback": True}
+        cur.execute("INSERT INTO kv(scope,key,value) VALUES(?,?,?) ON CONFLICT(scope,key) DO UPDATE SET value=excluded.value",
+                    ("aa_remap", "state", json.dumps(state)))
+        conn.commit()
+    except Exception as e:
+        log(f"[Remap] tandai rollback gagal {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _combo_first_model():
     conn = get_db()
     try:
@@ -382,6 +419,7 @@ def _run_remap(force=False):
                 log("[Remap] combo rollback restored")
             except Exception as rollback_error:
                 log(f"[Remap] rollback failed {rollback_error}")
+        _mark_remap_rolled_back(error)
         _save_cycle_state({"successCycle": _cycle_state().get("successCycle"), "attemptCycle": cycle_id, "at": get_iso_now(), "status": f"error:{error}"})
         return 4
     finally:

@@ -454,6 +454,43 @@ def test_slug_outside_top20_still_allowed():
     assert [item["mid"] for item in groups2["vendor"]] == ["vendor/top-model", "vendor/low-model"]
 
 
+def test_quorum_blocks_minority_active_prefix():
+    import sqlite3 as _sqlite3
+    import tempfile as _tempfile
+    import os as _os
+    tmp = _tempfile.mkdtemp()
+    db = _os.path.join(tmp, "q.sqlite")
+    conn = _sqlite3.connect(db)
+    conn.execute("CREATE TABLE providerConnections(provider TEXT, data TEXT, isActive INT)")
+    for i in range(4):
+        conn.execute("INSERT INTO providerConnections VALUES('openrouter', '{}', ?)", (1 if i == 0 else 0,))
+    conn.execute("INSERT INTO providerConnections VALUES('groq', '{}', 1)")
+    conn.commit()
+    catalog = [{"id": "openrouter/x", "owned_by": "openrouter"}, {"id": "groq/y", "owned_by": "groq"}]
+    try:
+        assert aa_rank.active_route_prefixes(conn, catalog) == {"groq"}
+        assert aa_rank.active_route_prefixes(conn, catalog, quorum=0.25) == {"groq", "openrouter"}
+    finally:
+        conn.close()
+        import shutil as _shutil
+        _shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_stream_ok_sse_success():
+    raw = 'data: {"choices": [{"delta": {"content": "PONG"}}]}\n\ndata: [DONE]\n'
+    assert key_manager._stream_ok(raw) is True
+
+
+def test_stream_ok_sse_error():
+    raw = 'data: {"error": {"message": "bad"}}\n\ndata: [DONE]\n'
+    assert key_manager._stream_ok(raw) is False
+
+
+def test_stream_ok_plain_choices():
+    assert key_manager._stream_ok('{"choices": [{"message": {"content": "PONG"}}]}') is True
+    assert key_manager._stream_ok('{"error": "nope", "choices": []}') is False
+
+
 if __name__ == "__main__":
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:

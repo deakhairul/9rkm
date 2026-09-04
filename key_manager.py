@@ -216,25 +216,16 @@ def _restore_combos(snapshot):
     finally:
         conn.close()
 
-def _probe_combo(name):
+def _router_api_key():
     conn = get_db()
     try:
         row = conn.execute("SELECT key FROM apiKeys LIMIT 1").fetchone()
-        api_key = row[0] if row else None
+        return row[0] if row else None
     finally:
         conn.close()
-    if not api_key:
-        return False
-    payload = json.dumps({"model": name, "messages": [{"role": "user", "content": "Reply PONG only"}], "max_tokens": 64, "stream": True}).encode()
-    request = urllib.request.Request("http://127.0.0.1:20128/v1/chat/completions", data=payload, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "Accept": "text/event-stream"})
-    try:
-        with urllib.request.urlopen(request, timeout=600) as response:
-            if not (200 <= response.status < 300):
-                return False
-            raw = response.read().decode("utf-8", errors="replace")
-    # NOTE: timeout 600s — combo 17 fallback berurutan butuh waktu; E2E boleh lambat asal 2xx+konten.
-    except Exception:
-        return False
+
+
+def _stream_ok(raw):
     # SSE stream: first content-bearing data chunk decides (responses-kind
     # models return empty body with stream:false, so stream:true is required).
     if "data:" in raw:
@@ -250,6 +241,56 @@ def _probe_combo(name):
             return True
         return False
     return '"choices"' in raw and '"error"' not in raw[:500]
+
+
+def _probe_combo(name):
+    api_key = _router_api_key()
+    if not api_key:
+        return False
+    payload = json.dumps({"model": name, "messages": [{"role": "user", "content": "Reply PONG only"}], "max_tokens": 64, "stream": True}).encode()
+    request = urllib.request.Request("http://127.0.0.1:20128/v1/chat/completions", data=payload, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "Accept": "text/event-stream"})
+    try:
+        with urllib.request.urlopen(request, timeout=600) as response:
+            if not (200 <= response.status < 300):
+                return False
+            raw = response.read().decode("utf-8", errors="replace")
+    # NOTE: timeout 600s — combo 17 fallback berurutan butuh waktu; E2E boleh lambat asal 2xx+konten.
+    except Exception:
+        return False
+    return _stream_ok(raw)
+
+
+def _combo_first_model():
+    conn = get_db()
+    try:
+        for name in COMBO_NAMES:
+            row = conn.execute("SELECT models FROM combos WHERE name=?", (name,)).fetchone()
+            if row and row[0]:
+                try:
+                    arr = json.loads(row[0])
+                    if isinstance(arr, list) and arr:
+                        return arr[0]
+                except Exception:
+                    pass
+    finally:
+        conn.close()
+    return None
+
+
+def _probe_model_direct(mid, timeout=180):
+    api_key = _router_api_key()
+    if not api_key:
+        return False
+    payload = json.dumps({"model": mid, "messages": [{"role": "user", "content": "Reply PONG only"}], "max_tokens": 64, "stream": True}).encode()
+    request = urllib.request.Request("http://127.0.0.1:20128/v1/chat/completions", data=payload, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "Accept": "text/event-stream"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            if not (200 <= response.status < 300):
+                return False
+            raw = response.read().decode("utf-8", errors="replace")
+    except Exception:
+        return False
+    return _stream_ok(raw)
 
 def _cycle_state():
     conn = get_db()
@@ -323,6 +364,9 @@ def _run_remap(force=False):
             raise RuntimeError("router not ready after restart")
         if not all(_probe_combo(name) for name in COMBO_NAMES):
             raise RuntimeError("combo E2E failed")
+        first = _combo_first_model()
+        if not first or not _probe_model_direct(first):
+            raise RuntimeError("first-model E2E failed")
         _, _, reset_status = run_reset()
         if reset_status != "ok":
             raise RuntimeError(f"reset after remap {reset_status}")

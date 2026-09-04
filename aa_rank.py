@@ -365,6 +365,14 @@ PREFIX_PROVIDER_MAP = {
     "ocr": ["openai-compatible-responses-59d9ff3d-ceb8-4958-a5f9-da2a7e0a3a2e"],
 }
 
+def _route_prefixes_for(provider_id, specific_prefix):
+    routes = {provider_id, specific_prefix} - {""}
+    for route_prefix, provider_ids in PREFIX_PROVIDER_MAP.items():
+        if provider_id in provider_ids or specific_prefix in provider_ids:
+            routes.add(route_prefix)
+    return routes
+
+
 def connection_inventory(conn):
     inventory = {}
     rows = conn.execute("SELECT provider, data FROM providerConnections WHERE isActive=1").fetchall()
@@ -376,13 +384,30 @@ def connection_inventory(conn):
         provider_id = (provider or "").lower()
         specific = data.get("providerSpecificData") if isinstance(data, dict) else None
         specific_prefix = (specific.get("prefix") or "").strip().lower() if isinstance(specific, dict) else ""
-        routes = {provider_id, specific_prefix} - {""}
-        for route_prefix, provider_ids in PREFIX_PROVIDER_MAP.items():
-            if provider_id in provider_ids or specific_prefix in provider_ids:
-                routes.add(route_prefix)
-        for route in routes:
+        for route in _route_prefixes_for(provider_id, specific_prefix):
             inventory.setdefault(route, []).append(data)
     return inventory
+
+
+QUORUM_MIN_RATIO = 0.5
+
+
+def prefix_census(conn):
+    total, active = {}, {}
+    rows = conn.execute("SELECT provider, data, isActive FROM providerConnections").fetchall()
+    for provider, raw, is_active in rows:
+        try:
+            data = json.loads(raw) if raw else {}
+        except Exception:
+            data = {}
+        provider_id = (provider or "").lower()
+        specific = data.get("providerSpecificData") if isinstance(data, dict) else None
+        specific_prefix = (specific.get("prefix") or "").strip().lower() if isinstance(specific, dict) else ""
+        for route in _route_prefixes_for(provider_id, specific_prefix):
+            total[route] = total.get(route, 0) + 1
+            if is_active:
+                active[route] = active.get(route, 0) + 1
+    return total, active
 
 def model_lock_active(connection, model, now=None):
     now = now or datetime.datetime.now(datetime.timezone.utc)
@@ -596,12 +621,21 @@ def fetch_router_catalog(conn):
         catalog.extend({**model, "id": f"openrouter/{model['id']}", "owned_by": "openrouter"} for model in upstream if isinstance(model, dict) and model.get("id"))
     return catalog
 
-def active_route_prefixes(conn, catalog, inventory=None):
+def active_route_prefixes(conn, catalog, inventory=None, quorum=QUORUM_MIN_RATIO):
     inventory = inventory or connection_inventory(conn)
     prefixes = {str(model.get("id")).split("/", 1)[0].lower() for model in catalog}
-    return prefixes & set(inventory)
+    eligible = prefixes & set(inventory)
+    total, active = prefix_census(conn)
+    kept = set()
+    for route in sorted(eligible):
+        ratio = (active.get(route, 0) / total[route]) if total.get(route) else 0.0
+        if ratio >= quorum:
+            kept.add(route)
+        else:
+            log(f"[aa_rank] quorum SKIP {route} aktif {active.get(route, 0)}/{total.get(route, 0)} < {quorum}")
+    return kept
 
-PROBE_MAX_TOKENS = (16, 64)
+PROBE_MAX_TOKENS = (16, 256)
 PROBE_RETRY_SLEEP = int(os.environ.get("AA_PROBE_RETRY_SLEEP", "30"))
 
 PAYMENT_REJECT_MARKERS = (

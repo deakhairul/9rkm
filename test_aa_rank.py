@@ -115,12 +115,45 @@ def test_model_lock_prefilter_requires_all_keys_locked():
     assert kept == catalog and skipped == 0
 
 
-def test_scan_pauses_during_remap():
-    key_manager.REMAP_PROBING.set()
+def test_no_key_writers_remap_only():
+    # Remap-only 2026-09-05: 9RKM tidak boleh menulis providerConnections.isActive,
+    # tidak ada scan/reset/bulk/toggle, tidak ada endpoint on/off key.
+    import inspect
+    assert not hasattr(key_manager, "run_scan_tick")
+    assert not hasattr(key_manager, "run_reset")
+    assert not hasattr(key_manager, "bulk_activate_all")
+    assert not hasattr(key_manager, "bulk_deactivate_all")
+    assert not hasattr(key_manager, "get_toggle")
+    assert not hasattr(key_manager, "set_toggle")
+    assert not hasattr(key_manager, "candidates_from_error_code")
+    assert not hasattr(key_manager, "reset_cycle_thread")
+    assert hasattr(key_manager, "remap_scheduler_thread")
+    src = inspect.getsource(key_manager)
+    assert "isActive = 0" not in src, "dilarang mematikan key"
+    assert "isActive = 1" not in src, "dilarang menyalakan key"
+    assert "/api/toggle" not in src
+    assert "/api/keys/" not in src
+
+
+def test_eligibility_includes_disabled_connections():
+    # Saringan = probe, bukan flag: koneksi isActive=0 tetap masuk inventory.
+    import sqlite3 as _sqlite3
+    import tempfile as _tempfile
+    import os as _os
+    tmp = _tempfile.mkdtemp()
+    db = _os.path.join(tmp, "e.sqlite")
+    conn = _sqlite3.connect(db)
+    conn.execute("CREATE TABLE providerConnections(provider TEXT, data TEXT, isActive INT)")
+    conn.execute("INSERT INTO providerConnections VALUES('groq', '{\"providerSpecificData\": {\"prefix\": \"groq\"}}', 0)")
+    conn.commit()
     try:
-        assert key_manager.run_scan_tick() == (0, "remap-probing")
+        inv = aa_rank.connection_inventory(conn)
+        assert "groq" in inv, "koneksi OFF harus tetap eligible discovery"
+        assert aa_rank.has_active_connection(conn, "groq") is True
     finally:
-        key_manager.REMAP_PROBING.clear()
+        conn.close()
+        import shutil as _shutil
+        _shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_free_classifier():
@@ -176,10 +209,7 @@ def test_do_remap_lock_is_flock_not_oexcl():
     assert "os.remove(lock_path)" not in src, "tidak boleh hapus lock proses lain"
 
 
-def test_run_reset_activates_all_regardless_of_state():
-    import inspect
-    src = inspect.getsource(key_manager.run_reset)
-    assert "WHERE id IN" in src and "isActive = 1" in src, "reset mengaktifkan SEMUA key tanpa filter"
+# (test_run_reset_activates_all DIHAPUS 2026-09-05: reset tidak ada lagi — remap-only)
 
 
 # ---------- Lifecycle behavioral tests (SQLite temp, tanpa framework) ----------
@@ -215,211 +245,83 @@ def _lifecycle_env():
     return km, db, tmp
 
 
-def _fresh_ts():
-    # error fresh relatif waktu sekarang (mencegah test basi saat tanggal lewat window 1 jam)
-    # Presisi ms wajib: format detik-bulat ("000Z") membuat err_ts < success_ts artifisial
-    # sehingga candidates_from_error_code mengira sukses-lebih-baru dan tes jadi flaky
-    # (lolos hanya bila sleep 0.25s melintasi batas detik).
-    return _datetime.datetime.now(_datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+# ---------- Remap-only behavioral tests (SQLite temp, tanpa framework) ----------
 
-
-def _mk_conn(db, cid, active=1, error=None, err_at=None):
-    err_at = err_at or _fresh_ts()
+def _mk_conn(db, cid, active=1):
     conn = _sqlite3.connect(db)
-    existing = conn.execute("SELECT data FROM providerConnections WHERE id=?", (cid,)).fetchone()
-    data = _json.loads(existing[0]) if existing else {}
-    if error is not None:
-        data.update({"errorCode": error, "lastError": "x", "lastErrorAt": err_at})
-    else:
-        data.pop("errorCode", None); data.pop("lastError", None); data.pop("lastErrorAt", None)
-    conn.execute("INSERT OR REPLACE INTO providerConnections VALUES(?,?,?,?,?,?,?)", (cid, "p-" + cid, "k-" + cid, "a@b", active, _json.dumps(data), "2026-08-31T10:00:00.000Z"))
+    conn.execute("INSERT OR REPLACE INTO providerConnections VALUES(?,?,?,?,?,?,?)", (cid, "p-" + cid, "k-" + cid, "a@b", active, "{}", "2026-09-05T10:00:00.000Z"))
     conn.commit()
     conn.close()
 
 
-def _mk_req(db, cid, ts, status):
-    conn = _sqlite3.connect(db)
-    conn.execute("INSERT INTO requestDetails(timestamp, connectionId, status, data) VALUES(?,?,?,?)", (ts, cid, status, "{}"))
-    conn.commit()
-    conn.close()
-
-
-def _state(db, cid):
-    conn = _sqlite3.connect(db)
-    row = conn.execute("SELECT value FROM kv WHERE scope='hourly_key_disable' AND key='state'").fetchone()
-    conn.close()
-    return (_json.loads(row[0]) if row else {}).get(cid, {})
-
-
-def _cycle(n):
-    return 332000 + n  # id siklus dummy berurutan
-
-
-def test_lifecycle_three_cycles_reach_S3():
+def test_version_change_triggers_once_then_cooldown():
+    import time as _time
     km, db, tmp = _lifecycle_env()
-    km.REMAP_PROBING.clear()
     try:
-        for i in range(3):
-            _mk_conn(db, "c1", active=1, error=401, err_at=_fresh_ts())
-            km.get_cycle_id = lambda: _cycle(i)
-            km.run_scan_tick()
-            assert _state(db, "c1")["failed_cycles"] == i + 1, f"siklus {i}: {_state(db, 'c1')}"
-            assert km._state_row_active(db, "c1") == 0
-            # reset sukses remap: aktifkan lagi, error dibersihkan, counter PERTAHAN
-            _mk_conn(db, "c1", active=1)
-            km.run_reset()
-            st = _state(db, "c1")
-            assert st["failed_cycles"] == i + 1, f"reset hapus counter di siklus {i}"
-            assert km._state_row_active(db, "c1") == 1
-        snap = km.status_snapshot()
-        assert snap["problem_count"] == 1
-        assert snap["problem"][0]["failed_cycles"] == 3
+        km._fetch_aa_version = lambda timeout=25: "4.2"
+        km._remap_ver = lambda: "4.1"
+        changed, live, base = km._check_version_changed()
+        assert (changed, live, base) == (True, "4.2", "4.1")
+        # scheduler mencatat trigger sukses → cek berikut cooldown
+        km._save_cycle_state({**km._cycle_state(), "lastVersionTrig": _time.time()})
+        changed2, _, _ = km._check_version_changed()
+        assert changed2 is False, "cooldown harus menunda trigger kedua"
+        # setelah remap menulis ver baru → tidak ada perubahan
+        km._remap_ver = lambda: "4.2"
+        km._save_cycle_state({**km._cycle_state(), "lastVersionTrig": 0})
+        changed3, live3, base3 = km._check_version_changed()
+        assert changed3 is False and live3 == "4.2" and base3 == "4.2"
     finally:
         _os.environ.pop("ROUTER_DB", None)
         import shutil as _shutil
         _shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_lifecycle_same_cycle_no_double_count():
+def test_version_check_failure_is_recorded_not_fatal():
     km, db, tmp = _lifecycle_env()
     try:
-        km.get_cycle_id = lambda: _cycle(0)
-        for round in range(2):
-            _mk_conn(db, "c1", active=1, error=402, err_at=_fresh_ts())
-            km.run_scan_tick()
-            _mk_conn(db, "c1", active=1)  # reaktivasi tanpa sukses
-        assert _state(db, "c1")["failed_cycles"] == 1
+        def boom(timeout=25):
+            raise RuntimeError("jaringan putus")
+        km._fetch_aa_version = boom
+        changed, live, base = km._check_version_changed()
+        assert changed is False and live is None
+        vst = km._read_version_state()
+        assert vst.get("lastCheckError"), "gagal cek harus tercatat"
     finally:
         _os.environ.pop("ROUTER_DB", None)
         import shutil as _shutil
         _shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_lifecycle_real_success_clears_counter():
+def test_schedule_due_logic():
     km, db, tmp = _lifecycle_env()
     try:
-        km.get_cycle_id = lambda: _cycle(0)
-        _mk_conn(db, "c1", active=1, error=429, err_at=_fresh_ts())
-        km.run_scan_tick()
-        assert _state(db, "c1")["failed_cycles"] == 1
-        auto_off_ts = _state(db, "c1")["auto_off_ts"]
-        # sukses nyata SETELAH auto_off_ts (dalam window 1 jam scan) → counter reset
-        _mk_conn(db, "c1", active=1)
-        import datetime as _dt
-        base = _dt.datetime.fromisoformat(auto_off_ts.replace("Z", "+00:00"))
-        succ_ts = (base + _dt.timedelta(milliseconds=100)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-        _mk_req(db, "c1", succ_ts, "success")
-        import time as _time
-        _time.sleep(0.25)  # pastikan succ_ts <= now saat tick
-        km.run_scan_tick()
-        st = _state(db, "c1")
-        assert st.get("failed_cycles", 0) == 0, st
-        assert "auto_off_ts" not in st
+        km.get_cycle_id = lambda: 777
+        assert km._due_schedule() is True, "belum ada successCycle = jatuh tempo"
+        km._save_cycle_state({"successCycle": 777, "at": "x", "status": "ok"})
+        assert km._due_schedule() is False
+        km.get_cycle_id = lambda: 778
+        assert km._due_schedule() is True
     finally:
         _os.environ.pop("ROUTER_DB", None)
         import shutil as _shutil
         _shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_lifecycle_success_then_new_fail_restarts_at_1():
-    km, db, tmp = _lifecycle_env()
-    try:
-        km.get_cycle_id = lambda: _cycle(1)
-        _mk_conn(db, "c1", active=1, error=403, err_at=_fresh_ts())
-        km.run_scan_tick()
-        # streak 1, sukses lalu fail lagi dalam siklus BARU → restart dari 1
-        _mk_conn(db, "c1", active=1)
-        auto_off_ts = _state(db, "c1")["auto_off_ts"]
-        import datetime as _dt
-        base = _dt.datetime.fromisoformat(auto_off_ts.replace("Z", "+00:00"))
-        succ_ts = (base + _dt.timedelta(milliseconds=100)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-        _mk_req(db, "c1", succ_ts, "success")
-        import time as _time
-        _time.sleep(0.25)
-        km.get_cycle_id = lambda: _cycle(2)
-        _mk_conn(db, "c1", active=1, error=403, err_at=_fresh_ts())
-        km.run_scan_tick()
-        assert _state(db, "c1")["failed_cycles"] == 1, "sukses lalu gagal = streak baru mulai 1"
-    finally:
-        _os.environ.pop("ROUTER_DB", None)
-        import shutil as _shutil
-        _shutil.rmtree(tmp, ignore_errors=True)
-
-
-def test_lifecycle_activate_all_preserves_counter():
-    km, db, tmp = _lifecycle_env()
-    try:
-        km.get_cycle_id = lambda: _cycle(0)
-        _mk_conn(db, "c1", active=1, error=401, err_at=_fresh_ts())
-        km.run_scan_tick()
-        km.bulk_activate_all("test")
-        st = _state(db, "c1")
-        assert st.get("failed_cycles") == 1, "ACTIVATE ALL tidak boleh hapus counter"
-        assert km._state_row_active(db, "c1") == 1
-    finally:
-        _os.environ.pop("ROUTER_DB", None)
-        import shutil as _shutil
-        _shutil.rmtree(tmp, ignore_errors=True)
-
-
-def test_lifecycle_deactivate_all_not_a_failure():
+def test_status_snapshot_remap_only_shape():
     km, db, tmp = _lifecycle_env()
     try:
         _mk_conn(db, "c1", active=1)
-        km.bulk_deactivate_all("test")
-        assert _state(db, "c1").get("failed_cycles", 0) == 0
+        _mk_conn(db, "c2", active=0)
         snap = km.status_snapshot()
-        k = [x for x in snap["keys"] if x["key"] == "k-c1"]
-        assert k and k[0]["status"] == "OFF (bulk)", k
-        # reset → aktif, lalu auto-off otomatis → label OFF (bukan stale OFF bulk)
-        km.run_reset()
-        km.get_cycle_id = lambda: _cycle(0)
-        # error HARUS lebih baru dari bulk_at+10s (grace) agar jadi kandidat
-        c = _sqlite3.connect(db)
-        bulk_at = _json.loads(c.execute("SELECT value FROM kv WHERE scope='rkm_bulk' AND key='last'").fetchone()[0])["at"]
-        c.close()
-        base = _datetime.datetime.fromisoformat(bulk_at.replace("Z", "+00:00"))
-        err_ts = (base + _datetime.timedelta(seconds=11)).strftime("%Y-%m-%dT%H:%M:%S.") + "000Z"
-        _mk_conn(db, "c1", active=1, error=401, err_at=err_ts)
-        km.run_scan_tick()
-        snap = km.status_snapshot()
-        k = [x for x in snap["keys"] if x["key"] == "k-c1"]
-        assert k and k[0]["status"] == "OFF", k
-    finally:
-        _os.environ.pop("ROUTER_DB", None)
-        import shutil as _shutil
-        _shutil.rmtree(tmp, ignore_errors=True)
-
-
-def test_lifecycle_phantom_kv_ignored():
-    km, db, tmp = _lifecycle_env()
-    try:
-        conn = _sqlite3.connect(db)
-        ghost = {"ghost-1": {"failed_cycles": 9, "provider": "x", "name": "ghost"}}
-        conn.execute("INSERT INTO kv VALUES('hourly_key_disable','state',?)", (_json.dumps(ghost),))
-        conn.commit()
-        conn.close()
-        snap = km.status_snapshot()
-        assert snap["problem_count"] == 0, "KV tanpa connection nyata tidak boleh jadi problem"
-    finally:
-        _os.environ.pop("ROUTER_DB", None)
-        import shutil as _shutil
-        _shutil.rmtree(tmp, ignore_errors=True)
-
-
-def test_lifecycle_active_problem_shows_S():
-    km, db, tmp = _lifecycle_env()
-    try:
-        _mk_conn(db, "c1", active=1)
-        conn = _sqlite3.connect(db)
-        st = {"c1": {"failed_cycles": 3, "provider": "p-c1", "name": "k-c1"}}
-        conn.execute("INSERT INTO kv VALUES('hourly_key_disable','state',?)", (_json.dumps(st),))
-        conn.commit()
-        conn.close()
-        snap = km.status_snapshot()
-        k = [x for x in snap["keys"] if x["key"] == "k-c1"][0]
-        assert "S3" in k["ket"], k
-        assert k["status"] == "Aktif"
+        assert "enabled" not in snap and "toggle" not in snap
+        assert "problem_count" not in snap and "bulk_last" not in snap
+        assert snap["total"] == 2
+        assert snap["aaVersion"] is None
+        assert snap["versionCheck"] == {"at": None, "error": None}
+        keys = {k["key"]: k for k in snap["keys"]}
+        assert set(keys) == {"k-c1", "k-c2"}
+        assert all(k["status"] == "Aktif" for k in keys.values()), "tidak ada label OFF"
     finally:
         _os.environ.pop("ROUTER_DB", None)
         import shutil as _shutil
@@ -491,13 +393,7 @@ def test_stream_ok_plain_choices():
     assert key_manager._stream_ok('{"error": "nope", "choices": []}') is False
 
 
-def test_scan_cap_defers_overflow_to_next_ticks():
-    cands = [{"connectionId": f"c{i}"} for i in range(25)]
-    kept = key_manager._cap_candidates(cands)
-    assert len(kept) == key_manager.SCAN_MAX_OFF_PER_TICK
-    assert [c["connectionId"] for c in kept] == [f"c{i}" for i in range(key_manager.SCAN_MAX_OFF_PER_TICK)]
-    small = [{"connectionId": "a"}]
-    assert key_manager._cap_candidates(small) == small
+# (test_scan_cap DIHAPUS 2026-09-05: tidak ada scan — remap-only)
 
 
 def test_rollback_marks_visible_state_truthful():
@@ -507,7 +403,7 @@ def test_rollback_marks_visible_state_truthful():
         conn.execute("INSERT INTO combos VALUES('Artificial-Analysis-Intelligence-Index', ?)",
                      (_json.dumps(["a/x", "b/y"]),))
         conn.execute("INSERT INTO kv VALUES('aa_remap', 'state', ?)",
-                     (_json.dumps({"at": "lama", "source": "api", "intel": 99, "coverage": {}, "vision": 5}),))
+                     (_json.dumps({"at": "lama", "source": "api", "intel": 99, "coverage": {}, "vision": 5, "ver": "4.1"}),))
         conn.commit()
         conn.close()
         km._mark_remap_rolled_back("uji-gagal")
@@ -518,6 +414,7 @@ def test_rollback_marks_visible_state_truthful():
         assert st["source"].startswith("rollback:")
         assert st["intel"] == 2
         assert st["vision"] == 5
+        assert st["ver"] == "4.1", "rollback harus pertahankan versi"
         assert st["rollback"] is True
     finally:
         _os.environ.pop("ROUTER_DB", None)

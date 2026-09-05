@@ -52,32 +52,25 @@
   <div class="card">
     <div class="row">
       <div>
-        <div style="font-size:14px;font-weight:700">Key Manager</div>
-        <div class="log" id="toggleinfo">-</div>
+        <div style="font-size:14px;font-weight:700">Remap Combo (remap-only)</div>
+        <div class="log" id="verinfo">-</div>
       <div class="log" id="cycleinfo" style="margin-top:6px;font-weight:600"></div>
       </div>
-      <span class="badge off" id="badge">…</span>
-    </div>
-    <div class="row" style="margin-top:14px">
-      <button class="btn on" id="bOn" disabled>✅ KEY MANAGER ON</button>
-      <button class="btn off" id="bOff" disabled>⛔ KEY MANAGER OFF</button>
+      <span class="badge on" id="badge">REMAP AKTIF</span>
     </div>
   </div>
 
   <div class="card">
     <div style="font-size:14px;font-weight:700">Key 9Router</div>
     <div class="grid">
-      <div class="stat"><div class="v" id="sActive">-</div><div class="l">AKTIF / TOTAL</div></div>
-      <div class="stat"><div class="v" id="sRetired">-</div><div class="l">OFF BERULANG (≥3 siklus)</div></div>
+      <div class="stat"><div class="v" id="sActive">-</div><div class="l">TERKONFIGURASI / TOTAL</div></div>
+      <div class="stat"><div class="v" id="sVer">-</div><div class="l">AA VERSION</div></div>
       <div class="stat"><div class="v" id="sProv">-</div><div class="l">PROVIDER</div></div>
     </div>
     <div class="log" id="remaplog" style="margin-top:10px"></div>
     <div class="bulk-row">
       <button class="btn bulk remap" id="bRemap">🔄 REMAP COMBO</button>
-      <button class="btn bulk activate" id="bBulkOn">⚡ ACTIVATE ALL KEY</button>
-      <button class="btn bulk deactivate" id="bBulkOff">⛔ DEACTIVATE ALL KEY</button>
     </div>
-    <div class="log" id="bulklog"></div>
     <table id="tbl"><tr><th>Provider</th><th>Aktif</th></tr></table>
     <div style="margin-top:14px;font-size:13px;font-weight:700">Detail Key</div>
     <div style="overflow-x:auto;max-height:60vh;overflow-y:auto;border:1px solid var(--line);border-radius:10px;margin-top:8px">
@@ -96,12 +89,6 @@
     <table id="tblAlias"><tr><th>Tipe</th><th>Label</th><th>Mid</th><th>Skor/Alasan</th><th>Conf</th><th>Aksi</th></tr></table>
   </div>
 
-  <dialog id="dlgOff"><form method="dialog"><div style="font-weight:700;color:var(--bad)">DEACTIVATE ALL KEY?</div><div class="log" style="margin:6px 0">Semua key akan OFF. Siklus berikutnya menyalakan semua kembali; key yang masih error akan OFF lagi otomatis. Ketik <b>OFF</b> untuk konfirmasi.</div><input id="dlgOffInput" placeholder="OFF" autocomplete="off"><div class="row" style="margin-top:10px"><button value="cancel" class="btn" style="flex:1">Batal</button><button id="dlgOffOk" value="ok" class="btn off" style="flex:1">DEACTIVATE</button></div></form></dialog>
-  <dialog id="dlgOn"><form method="dialog"><div style="font-weight:700;color:var(--ok)">ACTIVATE ALL KEY?</div><div class="log" style="margin:6px 0">Semua key akan diaktifkan &amp; dibersihkan error.</div><div class="row" style="margin-top:10px"><button value="cancel" class="btn" style="flex:1">Batal</button><button value="ok" class="btn on" style="flex:1">ACTIVATE</button></div></form></dialog>
-  <div class="card" id="retiredCard" style="display:none">
-    <div style="font-size:14px;font-weight:700">Key OFF berulang (≥3 siklus — cari akar masalah)</div>
-    <table id="tblRetired"><tr><th>Provider</th><th>Nama</th><th>Siklus</th></tr></table>
-  </div>
 </div>
 
 <script>
@@ -118,17 +105,14 @@ async function api(path, opts = {}) {
 function render(s) {
   snap = s;
   $('ts').textContent = 'Update: ' + s.ts;
-  const on = s.enabled;
   const b = $('badge');
-  b.textContent = on ? 'KEY MANAGER AKTIF' : 'KEY MANAGER OFF';
-  b.className = 'badge ' + (on ? 'on' : 'off');
-  const t = s.toggle || {};
-  $('toggleinfo').textContent = (t.by ? 'by ' + t.by + ' @ ' + (t.at || '') : 'default ON');
-  (function(){const c=s.cycle; if(!c){ $('cycleinfo').textContent=''; return; } let rem=Math.max(0,c.remainingSec|0); const tick=()=>{let r=Math.max(0,rem--); let h=Math.floor(r/3600), m=Math.floor((r%3600)/60), s2=r%60; const pad=n=>String(n).padStart(2,'0'); const txt=c.enabled?'⏰ Auto ON: '+c.wib+' (in '+h+'j '+pad(m)+'m '+pad(s2)+'s)':'⏸ Auto ON jeda (toggle OFF) — berikutnya jika ON: '+c.wib+' ('+h+'j '+pad(m)+'m)'; $('cycleinfo').textContent=txt; if(r<=0) $('cycleinfo').textContent+=' — refresh...';}; tick(); if(window._cycleTimer) clearInterval(window._cycleTimer); window._cycleTimer=setInterval(tick,1000);})();
-  $('bOn').disabled = on;
-  $('bOff').disabled = !on;
+  b.textContent = 'REMAP AKTIF';
+  b.className = 'badge on';
+  const verTxt = 'AA ' + (s.aaVersion || '-') + (s.aaVersionChanged ? ' (berubah — remap otomatis jalan)' : '');
+  $('verinfo').textContent = verTxt + (s.versionCheck && s.versionCheck.at ? ' · cek ' + s.versionCheck.at : '') + (s.versionCheck && s.versionCheck.error ? ' · cek gagal: ' + s.versionCheck.error : '');
+  (function(){const c=s.cycle; if(!c){ $('cycleinfo').textContent=''; return; } let rem=Math.max(0,c.remainingSec|0); const tick=()=>{let r=Math.max(0,rem--); let h=Math.floor(r/3600), m=Math.floor((r%3600)/60), s2=r%60; const pad=n=>String(n).padStart(2,'0'); const txt='⏰ Remap berikut: '+c.wib+' (in '+h+'j '+pad(m)+'m '+pad(s2)+'s)'; $('cycleinfo').textContent=txt; if(r<=0) $('cycleinfo').textContent+=' — refresh...';}; tick(); if(window._cycleTimer) clearInterval(window._cycleTimer); window._cycleTimer=setInterval(tick,1000);})();
   $('sActive').textContent = s.active + ' / ' + s.total;
-  $('sRetired').textContent = s.problem_count;
+  $('sVer').textContent = s.aaVersion || '-';
   $('sProv').textContent = s.by_provider.length;
   const tb = $('tbl');
   while (tb.rows.length > 1) tb.deleteRow(1);
@@ -151,18 +135,6 @@ function render(s) {
     tdS.appendChild(sp);
     tr.insertCell().textContent = k.ket || '-';
   });
-  const rc = $('retiredCard');
-  if (s.problem_count > 0) {
-    rc.style.display = '';
-    const trb = $('tblRetired');
-    while (trb.rows.length > 1) trb.deleteRow(1);
-    (s.problem || []).forEach(r => {
-      const tr = trb.insertRow();
-      tr.insertCell().textContent = r.provider;
-      tr.insertCell().textContent = r.name || '-';
-      tr.insertCell().textContent = r.failed_cycles;
-    });
-  } else rc.style.display = 'none';
   $('log').textContent = '';
 }async function refresh() {
   try {
@@ -172,28 +144,12 @@ function render(s) {
   }
 }
 
-async function toggle(enabled) {
-  $('bOn').disabled = $('bOff').disabled = true;
-  try {
-    const s = await api('/api/toggle', {method: 'POST', body: JSON.stringify({enabled})});
-    render(s);
-    $('log').textContent = 'Toggle berhasil: ' + (enabled ? 'ON' : 'OFF') + ' @ ' + s.ts;
-  } catch (e) {
-    $('log').textContent = 'Gagal: ' + e.message;
-  }
-}
-
-function showBulk(s){const b=s.bulk_last;if(!b){$('bulklog').textContent='';return}$('bulklog').textContent='Bulk terakhir: '+b.action+' '+b.n+' key by '+b.by+' @ '+(b.at||'')}
-function renderBulk(s){showBulk(s)}
-
-const _renderOrig = render;
-render = function(s){_renderOrig(s);renderBulk(s)}
-
 function renderRemap(s){
   const r=s.remap||{};
   const el=document.getElementById('remaplog');
   if(!el) return;
   let txt='';
+  if(r.ver) txt+=`AA ${r.ver} `;
   if(r.locked) txt+='⏳ remap sedang jalan… ';
   if(r.cooldownSec>0) txt+=`cooldown ${Math.ceil(r.cooldownSec/60)}m `;
   if(r.lastWib) txt+=`last ${r.lastWib} src=${r.source||'-'} Intel ${r.intel??'-'} Vision ${r.vision??'-'} | cache ${r.cacheAgeH!=null?r.cacheAgeH+'j':'-'} `+(r.coverage?`Cov ${r.coverage.pct}%${r.coverage.warn?' \u26a0':''} `:'');
@@ -227,18 +183,7 @@ async function doRemap(force){
     setTimeout(()=>{ const b=document.getElementById('bRemap'); if(b) b.disabled=false; }, 2000);
   }
 }
-async function bulk(action){
-  const path = action==='on' ? '/api/keys/activate_all' : '/api/keys/deactivate_all';
-  $('bBulkOn').disabled=$('bBulkOff').disabled=true;
-  try{const s=await api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});render(s);$('bulklog').textContent='Bulk '+(action==='on'?'ACTIVATE':'DEACTIVATE')+' OK: '+s.bulk_result.n+' key @ '+s.ts}
-  catch(e){$('bulklog').textContent='Gagal bulk: '+e.message}
-  finally{$('bBulkOn').disabled=$('bBulkOff').disabled=false}
-}
-$('bOn').onclick = () => toggle(true);
-$('bOff').onclick = () => toggle(false);
-$('bBulkOn').onclick = () => $('dlgOn').showModal();
 const _bRemap=document.getElementById('bRemap'); if(_bRemap) _bRemap.onclick=()=>{ const force=confirm('Force = tarik API 1x dulu (jika 429 fallback DB). OK=force, Cancel=pakai cache DB langsung'); doRemap(force); };
-$('bBulkOff').onclick = () => {$('dlgOffInput').value='';$('dlgOff').showModal();};
 $('bAliasCheck').onclick = aliasCheck;
 async function aliasCheck(){
   const el=document.getElementById('aliaslog');
@@ -286,9 +231,6 @@ async function aliasApprove(body){
     await aliasCheck();
   }catch(e){ el.textContent='Gagal approve: '+e.message; }
 }
-$('dlgOn').addEventListener('close',()=>{if($('dlgOn').returnValue==='ok')bulk('on')});
-$('dlgOff').addEventListener('close',()=>{if($('dlgOff').returnValue==='ok' && $('dlgOffInput').value.trim()==='OFF')bulk('off');else if($('dlgOff').returnValue==='ok')$('bulklog').textContent='Batal: ketik OFF tidak cocok';});
-$('dlgOffInput').addEventListener('input',()=>{$('dlgOffOk').disabled=$('dlgOffInput').value.trim()!=='OFF'});
 refresh();
 setInterval(refresh, 15000);
 </script>

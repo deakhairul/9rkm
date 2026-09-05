@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-9RKM - 9Router Key Manager (2026-08-18)
-Satu daemon menggantikan key-disable-daemon.py + daily-key-check.py + hourly-key-disable.py:
-  - Thread scan 5s   : auto-OFF key error (logika kronologis daemon lama, identik)
-  - Thread cycle 5 jam: remap combo (side-effect-free) lalu reset ON semua key + json_remove errorCode
-  - Thread HTTP      : Web UI parity (status + toggle), Tailscale-only
-Toggle di scope KV 'key_auto_off_toggle' - terpisah dari state 'hourly_key_disable'.
-Konsep retire dihapus (ADR 0001): key error = cari akar masalah, diuji ulang tiap siklus.
+9RKM - 9Router Key Manager, edisi remap-only (2026-09-05, amendemen PRD remap-only).
+Satu daemon remap combo model terbaik tiap siklus 5 jam + auto-remap saat versi
+AA Intelligence Index berubah:
+  - Thread scheduler: remap terjadwal 5 jam + cek versi ringan 1x/jam
+  - Thread HTTP      : Web UI status + REMAP manual + approve alias, Tailscale-only
+On/off key DIHAPUS TOTAL (scan 5s, reset, bulk, toggle): 9RKM tidak pernah menulis
+providerConnections.isActive. Saringan satu-satunya = probe 2xx saat remap.
+Arsip versi on/off: riwayat git repo ini (pre-remap-only) + backup deploy §12.7.
 """
-import sys, os, time, json, sqlite3, html, datetime, threading
+import sys, os, time, json, sqlite3, datetime, threading
 import urllib.request, urllib.error, urllib.parse
 import http.server, socketserver
 import pathlib, subprocess
@@ -20,18 +21,22 @@ HTTP_HOST = os.environ.get("RKM_HTTP_HOST", "100.82.126.88")
 HTTP_PORT = int(os.environ.get("RKM_HTTP_PORT", "8819"))
 KV_SCOPE = "hourly_key_disable"
 KV_KEY = "state"
-TOGGLE_SCOPE = "key_auto_off_toggle"
-TOGGLE_KEY = "state"
 CYCLE_HOURS = 5
 CYCLE_SECONDS = CYCLE_HOURS * 3600
-SLEEP_INTERVAL = 5
+SCHED_TICK_SEC = 30
+SLEEP_INTERVAL = SCHED_TICK_SEC
 REMAP_LOCK = "/tmp/9rkm-remap.lock"
 REMAP_DEBOUNCE_SEC = 1800
 REMAP_STALE_SEC = 1800
 REMAP_LOG = "/tmp/aa_remap_last.log"
-REMAP_PROBING = threading.Event()
 REMAP_CYCLE_SCOPE = "aa_remap_cycle"
 REMAP_CYCLE_KEY = "state"
+VERSION_SCOPE = "aa_version"
+VERSION_KEY = "state"
+VERSION_CHECK_SEC = 3600
+VERSION_MIN_INTERVAL_SEC = 7200
+AA_API_BASE = "https://artificialanalysis.ai/api/v2/language/models/free"
+AA_KEY_ENV = "AA_API_KEY"
 COMBO_NAMES = ("Artificial-Analysis-Intelligence-Index",)
 EC_HINT = {400: "Request salah", 401: "Kunci salah/expired", 402: "Saldo habis", 403: "Akses ditolak", 429: "Kuota habis"}
 
@@ -67,10 +72,6 @@ def get_iso_now():
 def get_cycle_id(now=None):
     now = now or datetime.datetime.now(datetime.timezone.utc)
     return int(now.timestamp()) // CYCLE_SECONDS
-
-def get_cutoff_iso(hours=1):
-    dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)
-    return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 def load_env():
     vals = {}
@@ -145,7 +146,7 @@ def _release_remap_lock(descriptor):
     os.close(descriptor)
 
 def _remap_snapshot(cursor):
-    out = {"lastAt": None, "lastWib": None, "source": None, "intel": None, "coverage": None, "vision": None, "cacheAt": None, "cacheAgeH": None, "locked": False, "cooldownSec": 0}
+    out = {"lastAt": None, "lastWib": None, "source": None, "intel": None, "coverage": None, "vision": None, "ver": None, "cacheAt": None, "cacheAgeH": None, "locked": False, "cooldownSec": 0}
     try:
         cursor.execute("SELECT value FROM kv WHERE scope=? AND key=?", ("aa_cache", "state"))
         r = cursor.fetchone()
@@ -171,6 +172,7 @@ def _remap_snapshot(cursor):
             out["source"] = j.get("source")
             out["intel"] = j.get("intel")
             out["vision"] = j.get("vision")
+            out["ver"] = j.get("ver")
             out["coverage"] = j.get("coverage")
             if j.get("at"):
                 try:
@@ -284,7 +286,8 @@ def _mark_remap_rolled_back(reason):
                     pass
         state = {"at": get_iso_now(), "source": "rollback:" + str(reason)[:60],
                  "intel": n, "coverage": {"topk": 0, "covered": 0, "pct": 0.0, "warn": True, "missing": []},
-                 "vision": prev.get("vision"), "backup": prev.get("backup"), "rollback": True}
+                 "vision": prev.get("vision"), "ver": prev.get("ver"),
+                 "backup": prev.get("backup"), "rollback": True}
         cur.execute("INSERT INTO kv(scope,key,value) VALUES(?,?,?) ON CONFLICT(scope,key) DO UPDATE SET value=excluded.value",
                     ("aa_remap", "state", json.dumps(state)))
         conn.commit()
@@ -344,6 +347,140 @@ def _save_cycle_state(state):
     finally:
         conn.close()
 
+# ---------- Version watcher (FR-8) ----------
+
+def _aa_api_key():
+    if os.environ.get(AA_KEY_ENV):
+        return os.environ[AA_KEY_ENV].strip()
+    for p in (os.path.join(os.path.dirname(os.path.abspath(__file__)), ".aa_api_key"),
+              os.path.expanduser("~/scripts/9rkm/.aa_api_key"),
+              "/home/ubuntu/scripts/9rkm/.aa_api_key"):
+        try:
+            if os.path.exists(p):
+                v = pathlib.Path(p).read_text(encoding="utf-8").strip()
+                if v:
+                    return v
+        except Exception:
+            pass
+    return ""
+
+def _read_version_state():
+    conn = get_db()
+    try:
+        return load_state_from_db(conn.cursor(), VERSION_SCOPE, VERSION_KEY)
+    finally:
+        conn.close()
+
+def _save_version_state(state):
+    conn = get_db()
+    try:
+        save_state_to_db(conn.cursor(), state, VERSION_SCOPE, VERSION_KEY)
+        conn.commit()
+    finally:
+        conn.close()
+
+def _fetch_aa_version(timeout=25):
+    """Cek ringan: page=1 saja, baca intelligence_index_version. Hemat kuota."""
+    key = _aa_api_key()
+    if not key:
+        raise RuntimeError("AA API key missing")
+    req = urllib.request.Request(f"{AA_API_BASE}?page=1",
+                                 headers={"x-api-key": key, "User-Agent": "9rkm-version-watch/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        body = json.loads(r.read().decode())
+    return body.get("intelligence_index_version")
+
+def _remap_ver():
+    """Versi AA saat remap terakhir (ditulis aa_rank ke kv aa_remap/state)."""
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM kv WHERE scope=? AND key=?", ("aa_remap", "state"))
+        row = cur.fetchone()
+        if row and row["value"]:
+            try:
+                return json.loads(row["value"]).get("ver")
+            except Exception:
+                pass
+    finally:
+        conn.close()
+    return None
+
+def _check_version_changed():
+    """True bila versi live != versi remap terakhir. Selalu catat hasil cek."""
+    now = time.time()
+    vst = _read_version_state()
+    try:
+        live = _fetch_aa_version()
+    except Exception as e:
+        log(f"[Version] cek gagal: {e}")
+        vst["lastCheckAt"] = get_iso_now()
+        vst["lastCheckError"] = str(e)[:120]
+        _save_version_state(vst)
+        return False, None, None
+    prev_seen = vst.get("ver")
+    remap_ver = _remap_ver()
+    vst.update({"ver": live, "prevVer": prev_seen, "lastCheckAt": get_iso_now()})
+    vst.pop("lastCheckError", None)
+    _save_version_state(vst)
+    base = remap_ver or prev_seen
+    if live and base and live != base:
+        last_trig = 0
+        try:
+            last_trig = float(_cycle_state().get("lastVersionTrig") or 0)
+        except Exception:
+            last_trig = 0
+        if now - last_trig < VERSION_MIN_INTERVAL_SEC:
+            log(f"[Version] {base} -> {live} (cooldown, remap ditunda)")
+            return False, live, base
+        return True, live, base
+    return False, live, base
+
+def _due_schedule():
+    return _cycle_state().get("successCycle") != get_cycle_id()
+
+def remap_scheduler_thread():
+    fails = 0
+    last_ver_check = 0
+    while True:
+        try:
+            if _due_schedule():
+                code = _run_remap(reason="schedule")
+                last_ver_check = 0
+            else:
+                now = time.time()
+                if now - last_ver_check >= VERSION_CHECK_SEC:
+                    last_ver_check = now
+                    changed, live, base = _check_version_changed()
+                    if changed:
+                        log(f"[Version] {base} -> {live}: remap segera")
+                        code = _run_remap(force=True, reason=f"version:{base}->{live}")
+                        if code == 0:
+                            _save_cycle_state({**_cycle_state(), "lastVersionTrig": now})
+                        else:
+                            fails += 1
+                            if fails == 3:
+                                notify("Remap gagal 3x beruntun — backoff eksponensial aktif, cek coverage/E2E di /api/status.")
+                            time.sleep(min(300 * (2 ** min(fails - 1, 3)), 3600))
+                            continue
+                        last_ver_check = 0
+                fails = 0
+                time.sleep(SCHED_TICK_SEC)
+                continue
+            if code == 5:
+                time.sleep(30)
+            elif code:
+                fails += 1
+                if fails == 3:
+                    notify("Remap gagal 3x beruntun — backoff eksponensial aktif, cek coverage/E2E di /api/status.")
+                time.sleep(min(300 * (2 ** min(fails - 1, 3)), 3600))
+            else:
+                fails = 0
+                time.sleep(SCHED_TICK_SEC)
+        except Exception as e:
+            log(f"[-] Scheduler error: {e}")
+            time.sleep(SCHED_TICK_SEC)
+
 def _restart_router():
     result = subprocess.run(["pm2", "restart", "9router"], capture_output=True, text=True, timeout=30)
     return result.returncode == 0
@@ -366,14 +503,10 @@ def _wait_router_ready(timeout=180):
     log(f"[Remap] router not ready after {timeout}s (last={last})")
     return False
 
-def _run_remap(force=False):
+def _run_remap(force=False, reason="schedule"):
     cycle_id = get_cycle_id()
-    if not force and _cycle_state().get("successCycle") == cycle_id:
+    if not force and _cycle_state().get("successCycle") == cycle_id and reason == "schedule":
         return 0
-    enabled, _ = get_toggle()
-    if not enabled:
-        log("[Remap] skip (toggle OFF)")
-        return 3
     descriptor = _acquire_remap_lock()
     if descriptor is None:
         log("[Remap] locked skip")
@@ -381,7 +514,6 @@ def _run_remap(force=False):
     snapshot = None
     output = ""
     try:
-        REMAP_PROBING.set()
         snapshot = _combo_snapshot()
         log("[Remap] start discovery cycle")
         child_env = {**os.environ, "AA_REMAP_LOCK_HELD": "1"}
@@ -404,11 +536,9 @@ def _run_remap(force=False):
         first = _combo_first_model()
         if not first or not _probe_model_direct(first):
             raise RuntimeError("first-model E2E failed")
-        _, _, reset_status = run_reset()
-        if reset_status != "ok":
-            raise RuntimeError(f"reset after remap {reset_status}")
-        _save_cycle_state({"successCycle": cycle_id, "at": get_iso_now(), "status": "ok"})
-        log("[Remap] verified E2E + reset")
+        _save_cycle_state({"successCycle": cycle_id, "at": get_iso_now(), "status": "ok",
+                           "reason": reason, "lastReasonAt": get_iso_now()})
+        log(f"[Remap] verified E2E ({reason})")
         return 0
     except Exception as error:
         log(f"[Remap] error {error}")
@@ -427,14 +557,13 @@ def _run_remap(force=False):
             if output:
                 pathlib.Path(REMAP_LOG).write_text(output, encoding="utf-8")
         except Exception as log_error:
-            log(f"[Remap] tulis log gagal {log_error}")
-        REMAP_PROBING.clear()
+                log(f"[Remap] tulis log gagal {log_error}")
         _release_remap_lock(descriptor)
 
-def _run_remap_async(force=False):
+def _run_remap_async(force=False, reason="manual"):
     def worker():
-        code = _run_remap(True)
-        notify(f"Remap combo selesai force={force} exit={code} @ {get_iso_now()}")
+        code = _run_remap(True, reason)
+        notify(f"Remap combo selesai force={force} reason={reason} exit={code} @ {get_iso_now()}")
     threading.Thread(target=worker, daemon=True).start()
 
 
@@ -465,373 +594,25 @@ def save_state_to_db(cursor, state, scope=KV_SCOPE, key=KV_KEY):
         (scope, key, json_str)
     )
 
-# ---------- Toggle ----------
+# ---------- (Toggle/scan/bulk/reset DIHAPUS 2026-09-05: remap-only. Arsip: git pre-remap-only.) ----------
 
-def get_toggle():
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        st = load_state_from_db(cur, TOGGLE_SCOPE, TOGGLE_KEY)
-        return st.get("enabled", True), st
-    finally:
-        conn.close()
-
-def set_toggle(enabled, by):
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        st = {"enabled": bool(enabled), "by": by, "at": get_iso_now()}
-        save_state_to_db(cur, st, TOGGLE_SCOPE, TOGGLE_KEY)
-        conn.commit()
-        return st
-    finally:
-        conn.close()
-
-# ---------- Scan 5s (auto-OFF) ----------
+# ---------- (akhir blok hapus: toggle/scan) ----------
 
 
-
-def candidates_from_error_code(active_map, requests_by_conn, cutoff_iso, bulk_at_iso=None, bulk_grace_iso=None):
-    found = []
-    for cid, info in active_map.items():
-        d = info.get("data")
-        if not isinstance(d, dict):
-            continue
-        ec = d.get("errorCode")
-        if ec is None:
-            continue
-        try:
-            if int(str(ec).strip()) == 400:
-                lbl = str(info.get("label", "")).strip().lower()
-                if lbl == "bynara":
-                    continue
-                last_err = str(d.get("lastError") or "")
-                if "model rejected this request" in last_err:
-                    continue
-        except Exception:
-            pass  # ponytail: 400 is payload-specific; Bynara=>skip always, others=>skip only if "model rejected" (request-invalid), not invalid-key 400 — credential 401/403/429 still OFF
-        reqs = requests_by_conn.get(cid, [])
-        success_ts = None
-        for ts, status, _ in reversed(reqs):
-            if str(status).strip().lower() == "success":
-                success_ts = ts
-                break
-        err_ts = d.get("lastErrorAt")
-        if not err_ts or err_ts < cutoff_iso:
-            continue
-        if bulk_at_iso and err_ts <= bulk_at_iso:
-            continue
-        if bulk_grace_iso and err_ts <= bulk_grace_iso:
-            continue  # ponytail: grace 10s pasca-bulk; naikkan ke 30s jika gateway rewrite >10s, hapus jika mau strict err>bulk
-        if success_ts and success_ts > err_ts:
-            continue
-        found.append({
-            "connectionId": cid,
-            "consecutive_errors": 1,
-            "total_in_window": len(reqs),
-            "last_reason": f"errorCode {ec} (state gateway)",
-            "_source": "errorCode",
-        })
-    return found
-
-SCAN_MAX_OFF_PER_TICK = 10
+# ---------- (bulk/reset/cycle-reset DIHAPUS 2026-09-05: remap-only) ----------
 
 
-def _cap_candidates(candidates, limit=SCAN_MAX_OFF_PER_TICK):
-    if len(candidates) > limit:
-        log(f"[Auto-OFF 5s] breaker: {len(candidates)} kandidat > batas {limit}/tick — sisa ditunda tick berikut.")
-        return candidates[:limit]
-    return candidates
-
-
-def run_scan_tick():
-    if REMAP_PROBING.is_set():
-        return 0, "remap-probing"
-    now_wib = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7)))
-    today_wib = now_wib.strftime("%Y-%m-%d")
-    cutoff_iso = get_cutoff_iso(1)
-    now_iso = get_iso_now()
-    bulk_at_iso = None
-    bulk_grace_iso = None
-
-    conn = get_db()
-    try:
-        cursor = conn.cursor()
-
-        enabled, _ = get_toggle()
-        if not enabled:
-            save_state_to_db(cursor, load_state_from_db(cursor))
-            conn.commit()
-            return 0, "toggle-off"
-
-        cursor.execute("SELECT id, provider, name, email, isActive, data, updatedAt FROM providerConnections WHERE isActive = 1;")
-        active_map = {}
-        for row in cursor.fetchall():
-            try:
-                d = json.loads(row["data"]) if row["data"] else {}
-            except Exception:
-                d = {}
-            if not isinstance(d, dict):
-                d = {}
-            active_map[row["id"]] = {
-                "provider": row["provider"], "label": provider_label(row["provider"], d), "name": row["name"] or row["provider"],
-                "email": row["email"], "data": d, "updatedAt": row["updatedAt"] or ""
-            }
-
-        active_ids = set(active_map.keys())
-        if not active_ids:
-            return 0, "no-active"
-
-        placeholders = ",".join("?" for _ in active_ids)
-        sql = f"SELECT timestamp, connectionId, status, data FROM requestDetails WHERE connectionId IN ({placeholders}) AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC;"
-        cursor.execute(sql, list(active_ids) + [cutoff_iso, now_iso])
-        rd_rows = cursor.fetchall()
-
-        requests_by_conn = {}
-        for row in rd_rows:
-            cid = row["connectionId"]
-            requests_by_conn.setdefault(cid, []).append((row["timestamp"], row["status"], row["data"]))
-
-        try:
-            _bulk = load_state_from_db(cursor, BULK_SCOPE, BULK_KEY)
-            bulk_at_iso = _bulk.get("at") if isinstance(_bulk, dict) else None
-            if bulk_at_iso:
-                try:
-                    _dt = datetime.datetime.fromisoformat(bulk_at_iso.replace("Z", "+00:00"))
-                    _dt_g = _dt + datetime.timedelta(seconds=10)
-                    bulk_grace_iso = _dt_g.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_dt_g.microsecond//1000:03d}Z"
-                except Exception:
-                    bulk_grace_iso = None
-        except Exception:
-            pass
-        state = load_state_from_db(cursor)
-        current_cycle = get_cycle_id()
-        for cid, reqs in requests_by_conn.items():
-            if reqs and str(reqs[-1][1]).strip().lower() == "success":
-                if cid in state:
-                    auto_off_ts = state[cid].get("auto_off_ts") or ""
-                    latest_success = reqs[-1][0]  # reqs sorted ASC → sukses terakhir
-                    if not auto_off_ts or latest_success > auto_off_ts:
-                        # Sukses nyata SETELAH auto-off terakhir = bukti sembuh → reset streak (ADR 0001)
-                        state[cid]["failed_cycles"] = 0
-                        state[cid].pop("consecutive_off_days", None)
-                        state[cid].pop("off_cycle_id", None)
-                        state[cid].pop("counted_cycle_id", None)
-                        state[cid].pop("auto_off_ts", None)
-
-        candidates = _cap_candidates(
-            candidates_from_error_code(active_map, requests_by_conn, cutoff_iso, bulk_at_iso, bulk_grace_iso)
-        )
-
-        if not candidates:
-            save_state_to_db(cursor, state)
-            conn.commit()
-            return 0, "no-candidates"
-
-        cid_list = [c["connectionId"] for c in candidates]
-        placeholders_upd = ",".join("?" for _ in cid_list)
-        cursor.execute(f"UPDATE providerConnections SET isActive = 0, updatedAt = ? WHERE id IN ({placeholders_upd});", [now_iso] + cid_list)
-
-        off_list_msg = []
-        for c in candidates:
-            cid = c["connectionId"]
-            info = active_map.get(cid, {})
-            prov = info.get("label", info.get("provider", "unknown"))
-            name = info.get("name", prov)
-            conn_state = state.get(cid, {
-                "provider": prov, "name": name, "consecutive_off_days": 0,
-                "last_off_date": "", "manual_off": False, "auto_off_ts": ""
-            })
-            conn_state["provider"] = prov
-            conn_state["name"] = name
-            conn_state["manual_off"] = False
-            conn_state["auto_off_ts"] = now_iso
-            conn_state["off_cycle_id"] = current_cycle
-            if conn_state.get("counted_cycle_id") != current_cycle:
-                conn_state["failed_cycles"] = conn_state.get("failed_cycles", conn_state.get("consecutive_off_days", 0)) + 1
-                conn_state["counted_cycle_id"] = current_cycle
-            conn_state.pop("consecutive_off_days", None)
-            conn_state["last_off_date"] = today_wib
-            state[cid] = conn_state
-            src_label = "errorCode" if c.get("_source") == "errorCode" else f"{c['consecutive_errors']}x err"
-            off_list_msg.append(f"• <b>{html.escape(prov)}</b> ({html.escape(name[:20])}) — {src_label} ({html.escape(c['last_reason'])}) [Siklus ke-{conn_state.get('failed_cycles', 1)}]")
-
-        save_state_to_db(cursor, state)
-        conn.commit()
-        log(f"[Auto-OFF 5s] {len(cid_list)} key dimatikan instant.")
-        ts_fmt = now_wib.strftime("%d %b %H:%M:%S WIB")
-        notify(
-            f"⚡ <b>9Router Auto-OFF ({ts_fmt})</b>\n\n"
-            f"<b>{len(off_list_msg)}</b> key dimatikan (deteksi 5 detik):\n"
-            + "\n".join(off_list_msg)
-            + "\n\n<i>Key akan diuji/reset kembali pada siklus 5 jam berikutnya.</i>"
-        )
-        return len(cid_list), "off"
-    except Exception as e:
-        log(f"[-] Scan error: {e}")
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        return 0, f"error:{e}"
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-
-BULK_SCOPE = "rkm_bulk"
-BULK_KEY = "last"
-
-def bulk_activate_all(by="WebUI"):
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT id FROM providerConnections;")
-        ids = [r["id"] for r in cur.fetchall()]
-        now = get_iso_now()
-        if ids:
-            ph = ",".join("?" for _ in ids)
-            cur.execute(f"UPDATE providerConnections SET data = json_remove(data, '$.errorCode', '$.lastError', '$.lastErrorAt', '$.backoffLevel'), updatedAt = ? WHERE id IN ({ph}) AND json_valid(data);", [now] + ids)
-            cur.execute(f"UPDATE providerConnections SET isActive = 1, updatedAt = ? WHERE id IN ({ph});", [now] + ids)
-        state = load_state_from_db(cur)
-        for cid in ids:
-            st = state.get(cid, {})
-            # failed_cycles DIPERTAHANKAN (ADR 0001): menyalakan key bukan bukti sembuh
-            st.pop("consecutive_off_days", None)
-            st.pop("manual_off", None)
-            st.pop("manual_off_at", None)
-            st.pop("manual_off_by", None)
-            st.pop("auto_off_ts", None)
-            state[cid] = st
-        bulk = {"action": "activate_all", "by": by, "at": now, "n": len(ids)}
-        save_state_to_db(cur, bulk, BULK_SCOPE, BULK_KEY)
-        save_state_to_db(cur, state)
-        conn.commit()
-        log(f"[Bulk] ACTIVATE ALL {len(ids)} by {by}.")
-        notify(f"Bulk ACTIVATE ALL -- {len(ids)} key by {by} @ {now}")
-        return len(ids), bulk
-    finally:
-        conn.close()
-
-def bulk_deactivate_all(by="WebUI"):
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT id FROM providerConnections;")
-        ids = [r["id"] for r in cur.fetchall()]
-        now = get_iso_now()
-        if ids:
-            ph = ",".join("?" for _ in ids)
-            cur.execute(f"UPDATE providerConnections SET isActive = 0, updatedAt = ? WHERE id IN ({ph});", [now] + ids)
-        state = load_state_from_db(cur)
-        for cid in ids:
-            st = state.get(cid, {"failed_cycles": 0})
-            st["manual_off"] = True
-            st["manual_off_at"] = now
-            st["manual_off_by"] = by
-            state[cid] = st
-        bulk = {"action": "deactivate_all", "by": by, "at": now, "n": len(ids)}
-        save_state_to_db(cur, bulk, BULK_SCOPE, BULK_KEY)
-        save_state_to_db(cur, state)
-        conn.commit()
-        log(f"[Bulk] DEACTIVATE ALL {len(ids)} by {by}.")
-        notify(f"Bulk DEACTIVATE ALL -- {len(ids)} key by {by} @ {now}")
-        return len(ids), bulk
-    finally:
-        conn.close()
-
-# ---------- Cycle 5 jam (reset ON) ----------
-# Keputusan Dea 31 Agu: TIDAK ada istilah manual off yang berbeda — semua OFF diperlakukan setara,
-# semua key diuji ulang tiap siklus (lihat ADR 0001). manual_off hanya jejak histori di KV.
-
-def run_reset():
-    conn = get_db()
-    try:
-        cursor = conn.cursor()
-        enabled, _ = get_toggle()
-        if not enabled:
-            log(f"[Reset {CYCLE_HOURS}h] skip (toggle OFF).")
-            return 0, 0, "toggle-off"
-
-        cursor.execute("SELECT id, provider, name, email, isActive, data, updatedAt FROM providerConnections;")
-        rows = cursor.fetchall()
-        to_activate = [{"id": r["id"]} for r in rows]
-        now_iso = get_iso_now()
-
-        if to_activate:
-            act_ids = [c["id"] for c in to_activate]
-            placeholders = ",".join("?" for _ in act_ids)
-            cursor.execute(
-                f"UPDATE providerConnections SET data = json_remove(data, '$.errorCode', '$.lastError', '$.lastErrorAt', '$.backoffLevel'), updatedAt = ? WHERE id IN ({placeholders}) AND json_valid(data);",
-                [now_iso] + act_ids
-            )
-            cursor.execute(
-                f"UPDATE providerConnections SET isActive = 1, updatedAt = ? WHERE id IN ({placeholders});",
-                [now_iso] + act_ids
-            )
-            log(f"ON: {len(to_activate)} koneksi diaktifkan kembali (state error dibersihkan).")
-
-        state = load_state_from_db(cursor)
-        for cid in (c["id"] for c in to_activate):
-            st = state.get(cid, {})
-            # failed_cycles DIPERTAHANKAN: bukti investigasi hanya dihapus oleh request sukses nyata (ADR 0001)
-            st.pop("consecutive_off_days", None)
-            st.pop("manual_off", None)
-            st.pop("manual_off_at", None)
-            st.pop("manual_off_by", None)
-            st.pop("auto_off_ts", None)
-            state[cid] = st
-        save_state_to_db(cursor, state)
-        conn.commit()
-        return len(to_activate), 0, "ok"
-    except Exception as e:
-        log(f"[-] Reset error: {e}")
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        return 0, 0, f"error:{e}"
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-def reset_cycle_thread():
-    fails = 0
-    while True:
-        current = get_cycle_id()
-        enabled, _ = get_toggle()
-        if enabled and _cycle_state().get("successCycle") != current:
-            code = _run_remap()
-            if code == 5:
-                time.sleep(30)
-            elif code:
-                fails += 1
-                if fails == 3:
-                    notify("Remap gagal 3x beruntun — backoff eksponensial aktif, cek coverage/E2E di /api/status.")
-                time.sleep(min(300 * (2 ** min(fails - 1, 3)), 3600))
-            else:
-                fails = 0
-                time.sleep(30)
-        else:
-            fails = 0
-            time.sleep(30)
-
-# ---------- Status snapshot (dipakai TG + Web) ----------
+# ---------- Status snapshot (dipakai Web) ----------
 
 def status_snapshot():
-    enabled, togg = get_toggle()
     conn = get_db()
     try:
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) AS t, SUM(isActive) AS a FROM providerConnections;")
         r = cur.fetchone()
         total = r["t"] or 0
-        active = r["a"] or 0
-        cur.execute("SELECT id, provider, data FROM providerConnections WHERE isActive = 1;")
+        configured = r["a"] if r["a"] is not None else total
+        cur.execute("SELECT id, provider, data FROM providerConnections;")
         provider_counts = {}
         for row in cur.fetchall():
             try:
@@ -843,7 +624,6 @@ def status_snapshot():
         by_prov = [{"provider": label, "count": count} for label, count in sorted(provider_counts.items(), key=lambda item: (-item[1], item[0]))]
         cur.execute("SELECT id, provider, name, email, isActive, data FROM providerConnections ORDER BY provider, name;")
         conn_rows = cur.fetchall()
-        connection_labels = {}
         conn_data = {}
         for row in conn_rows:
             try:
@@ -852,29 +632,13 @@ def status_snapshot():
                 data = {}
             if not isinstance(data, dict):
                 data = {}
-            connection_labels[row["id"]] = (provider_label(row["provider"], data), row["name"] or row["provider"])
             conn_data[row["id"]] = data
-        state = load_state_from_db(cur)
-        problem = []
-        for cid, item in state.items():
-            if item.get("failed_cycles", 0) >= 3 and cid in connection_labels:
-                label, fallback_name = connection_labels[cid]
-                problem.append({"provider": label, "name": item.get("name") or fallback_name, "failed_cycles": item.get("failed_cycles", 0)})
-        bulk_last = load_state_from_db(cur, BULK_SCOPE, BULK_KEY)
         keys = []
         for row in conn_rows:
             cid = row["id"]
             d = conn_data.get(cid, {})
             prov_label = provider_label(row["provider"], d)
             name = (row["name"] or "").strip() or (row["email"] or "").strip() or cid[:8]
-            st = state.get(cid, {})
-            failed = st.get("failed_cycles", st.get("consecutive_off_days", 0))
-            if not row["isActive"]:
-                status = "OFF"
-                if st.get("manual_off"):
-                    status = "OFF (bulk)"
-            else:
-                status = "Aktif"
             ec = d.get("errorCode")
             last_err = d.get("lastError") or ""
             last_err = " ".join(str(last_err).split())[:80] if last_err else ""
@@ -883,11 +647,7 @@ def status_snapshot():
                 ket = f"{ec} {_hint(ec)}"
                 if last_err:
                     ket += f" · {last_err}"
-            if failed:
-                ket = (ket + f" · S{failed}") if ket != "-" else f"S{failed}"
-            elif not row["isActive"] and last_err:
-                ket = last_err
-            keys.append({"key": name, "provider": prov_label, "status": status, "ket": ket})
+            keys.append({"key": name, "provider": prov_label, "status": "Aktif", "ket": ket})
         keys.sort(key=lambda x: (0 if x["status"] != "Aktif" else 1, x["provider"], x["key"]))
         cur_id = get_cycle_id()
         next_at = (cur_id + 1) * CYCLE_SECONDS
@@ -896,18 +656,17 @@ def status_snapshot():
         if remaining < 0:
             remaining = 0
         wib = datetime.datetime.fromtimestamp(next_at, tz=datetime.timezone(datetime.timedelta(hours=7)))
-        cycle = {"nextAt": next_at, "remainingSec": remaining, "enabled": bool(enabled), "intervalSec": CYCLE_SECONDS, "wib": wib.strftime("%d %b %H:%M WIB")}
+        cycle = {"nextAt": next_at, "remainingSec": remaining, "intervalSec": CYCLE_SECONDS, "wib": wib.strftime("%d %b %H:%M WIB")}
         remap = _remap_snapshot(cur)
+        vst = load_state_from_db(cur, VERSION_SCOPE, VERSION_KEY)
         return {
-            "enabled": enabled,
-            "toggle": togg,
             "total": total,
-            "active": active,
+            "active": configured,
             "by_provider": by_prov,
-            "problem_count": len(problem),
-            "problem": problem,
-            "bulk_last": bulk_last if bulk_last else None,
             "remap": remap,
+            "aaVersion": remap.get("ver"),
+            "aaVersionChanged": bool(remap.get("ver") and vst.get("prevVer") and remap.get("ver") != vst.get("prevVer")),
+            "versionCheck": {"at": vst.get("lastCheckAt"), "error": vst.get("lastCheckError")},
             "keys": keys,
             "ts": datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7))).strftime("%Y-%m-%d %H:%M:%S WIB"),
             "cycle": cycle,
@@ -923,8 +682,6 @@ def status_snapshot():
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID") or os.environ.get("CHAT_ID") or load_env().get("CHAT_ID") or "355679325"
 TG_KEYBOARD = {"inline_keyboard": [
     [{"text": "📊 STATUS", "callback_data": "rkm:status"}],
-    [{"text": "✅ KEY MANAGER ON", "callback_data": "rkm:on"}],
-    [{"text": "⛔ KEY MANAGER OFF", "callback_data": "rkm:off"}],
 ]}
 
 
@@ -964,17 +721,15 @@ def tg_status_text():
     rs = int(c.get("remainingSec", 0))
     hh = rs // 3600
     mm = (rs % 3600) // 60
-    if c.get("enabled"):
-        timer = f"Auto ON: {c.get('wib','-')} (in {hh}j {mm}m)"
-    else:
-        timer = f"Auto ON jeda (toggle OFF) - berikutnya jika ON: {c.get('wib','-')} ({hh}j {mm}m)"
-    toggle = "🟢 ON" if s["enabled"] else "🔴 OFF"
+    timer = f"Remap berikut: {c.get('wib','-')} (in {hh}j {mm}m)"
+    r = s.get("remap") or {}
+    ver = r.get("ver") or "-"
     return (
-        "⚙️ <b>9RKM — Key Manager</b>\n\n"
-        f"Toggle: {toggle}\n"
-        f"Key aktif: <b>{s['active']}/{s['total']}</b>\n"
+        "⚙️ <b>9RKM — Remap Combo</b>\n\n"
+        f"AA ver: {ver}\n"
+        f"Key terkonfigurasi: <b>{s['active']}/{s['total']}</b>\n"
         f"Provider: {provs or '-'}\n"
-        f"OFF berulang (≥3 siklus): {s['problem_count']}\n"
+        f"Combo Intel: {r.get('intel', '-')}\n"
         f"{timer}\n\n"
         f"⏱ {s['ts']}"
     )
@@ -987,13 +742,7 @@ def tg_handle(update):
         if str(cb.get("from", {}).get("id")) != TG_CHAT_ID:
             return
         data = (cb.get("data") or "").strip()
-        if data == "rkm:on":
-            set_toggle(True, "TG")
-            tg_send("✅ Key Manager <b>ON</b> — scan 5s + reset 5 jam aktif.", keyboard=True)
-        elif data == "rkm:off":
-            set_toggle(False, "TG")
-            tg_send("⛔ Key Manager <b>OFF</b> — scan + reset berhenti.", keyboard=True)
-        elif data == "rkm:status":
+        if data == "rkm:status":
             tg_send(tg_status_text(), keyboard=True)
         else:
             log(f"[TG] callback tak dikenal: {data!r}")
@@ -1008,18 +757,8 @@ def tg_handle(update):
     low = (msg.get("text") or "").strip().lower()
     if low in ("/start", "/status"):
         tg_send(tg_status_text(), keyboard=True)
-    elif low.startswith("/keymanager"):
-        arg = low.replace("/keymanager", "").strip()
-        if arg == "on":
-            set_toggle(True, "TG")
-            tg_send("✅ Key Manager <b>ON</b> — scan 5s + reset 5 jam aktif.", keyboard=True)
-        elif arg == "off":
-            set_toggle(False, "TG")
-            tg_send("⛔ Key Manager <b>OFF</b> — scan + reset berhenti.", keyboard=True)
-        else:
-            tg_send(tg_status_text(), keyboard=True)
     else:
-        tg_send("Perintah: /status · /keymanager on|off", keyboard=True)
+        tg_send("Perintah: /status", keyboard=True)
 
 # ---------- HTTP (Web UI parity) ----------
 
@@ -1056,14 +795,6 @@ class RkmHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path.startswith("/api/tg"):
             self._json(410, {"error": "Telegram OFF - Web-only per AGENTS.md 17.8 (26 Agu 2026)"})
-            return
-        if self.path.startswith("/api/keys/activate_all"):
-            n, bulk = bulk_activate_all("WebUI")
-            self._json(200, {**status_snapshot(), "bulk_result": {"n": n, **bulk}})
-            return
-        if self.path.startswith("/api/keys/deactivate_all"):
-            n, bulk = bulk_deactivate_all("WebUI")
-            self._json(200, {**status_snapshot(), "bulk_result": {"n": n, **bulk}})
             return
         if self.path.startswith("/api/remap"):
             if self.path.startswith("/api/remap/log"):
@@ -1156,20 +887,6 @@ class RkmHandler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 self._json(500, {"error": str(e)})
             return
-        if self.path.startswith("/api/toggle"):
-            try:
-                ln = int(self.headers.get("Content-Length", 0))
-                body = json.loads(self.rfile.read(ln).decode()) if ln else {}
-            except Exception:
-                self._json(400, {"error": "bad json"})
-                return
-            if "enabled" not in body:
-                self._json(400, {"error": "missing enabled"})
-                return
-            st = set_toggle(bool(body["enabled"]), "WebUI")
-            log(f"[WebUI] toggle -> {'ON' if st['enabled'] else 'OFF'}.")
-            self._json(200, status_snapshot())
-            return
         self._json(404, {"error": "not found"})
 
     def log_message(self, *a):
@@ -1188,21 +905,15 @@ def http_thread():
 # ---------- Main ----------
 
 def main():
-    log("=== 9RKM — 9Router Key Manager started ===")
-    enabled, _ = get_toggle()
-    log(f"Toggle awal: {'ON' if enabled else 'OFF'}")
+    log("=== 9RKM remap-only started (scan/reset/toggle/bulk dihapus 2026-09-05) ===")
     threads = [
-        threading.Thread(target=reset_cycle_thread, daemon=True),
+        threading.Thread(target=remap_scheduler_thread, daemon=True),
         threading.Thread(target=http_thread, daemon=True),
     ]
     for t in threads:
         t.start()
-    while True:
-        try:
-            run_scan_tick()
-        except Exception as e:
-            log(f"[-] Loop error: {e}")
-        time.sleep(SLEEP_INTERVAL)
+    for t in threads:
+        t.join()
 
 if __name__ == "__main__":
     main()

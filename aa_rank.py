@@ -374,8 +374,10 @@ def _route_prefixes_for(provider_id, specific_prefix):
 
 
 def connection_inventory(conn):
+    # Remap-only (2026-09-05): SEMUA koneksi terkonfigurasi, bukan hanya isActive=1.
+    # 9RKM tidak pernah menulis isActive; saringan = probe 2xx.
     inventory = {}
-    rows = conn.execute("SELECT provider, data FROM providerConnections WHERE isActive=1").fetchall()
+    rows = conn.execute("SELECT provider, data FROM providerConnections").fetchall()
     for provider, raw in rows:
         try:
             data = json.loads(raw) if raw else {}
@@ -439,9 +441,11 @@ def filter_catalog_by_locks(catalog, inventory):
     return kept, skipped
 
 def has_active_connection(conn, prefix):
+    # Nama dipertahankan (dipakai rkm_remapper monkeypatch + tes); arti kini =
+    # punya koneksi TERKONFIGURASI (bukan isActive=1). Remap-only 2026-09-05.
     p = (prefix or "").lower()
     cur = conn.cursor()
-    cur.execute("SELECT provider, data FROM providerConnections WHERE isActive=1")
+    cur.execute("SELECT provider, data FROM providerConnections")
     active_prefixes = set()
     active_providers = set()
     for provider, raw in cur.fetchall():
@@ -702,7 +706,7 @@ def _provider_catalog(conn, prefix):
                 break
         if node_id and base:
             cur.execute(
-                "SELECT data FROM providerConnections WHERE provider=? AND isActive=1 LIMIT 1",
+                "SELECT data FROM providerConnections WHERE provider=? LIMIT 1",
                 (node_id,))
             row = cur.fetchone()
             key = (json.loads(row[0]).get("apiKey") or "") if row else ""
@@ -728,6 +732,7 @@ def in_provider_catalog(conn, mid):
     return True if ids is None else model in ids
 
 def filter_active_and_probe(conn, scored):
+    # Nama dipertahankan; "active" kini = terkonfigurasi (remap-only 2026-09-05).
     if not scored:
         return scored
     prefixes = { (mid.split("/")[0] if "/" in mid else mid).lower() for mid,_,_ in scored }
@@ -735,7 +740,7 @@ def filter_active_and_probe(conn, scored):
     for p in prefixes:
         active_ok[p] = has_active_connection(conn, p)
         if not active_ok[p]:
-            log(f"[aa_rank] SKIP prefix {p}: no isActive=1 connection")
+            log(f"[aa_rank] SKIP prefix {p}: no configured connection")
     filtered = []
     to_probe = []
     for mid, label, score in scored:
@@ -990,7 +995,7 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
             write_vision_adapter(conn, vision_pool)
         else:
             log("[aa_rank] vision unchanged")
-        remap_state = {"at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00","Z"), "source": source, "intel": len(intel_list), "coverage": coverage, "vision": len(vision_pool) if vision_pool else 0, "backup": bak, "rollback": rollback_path}
+        remap_state = {"at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00","Z"), "source": source, "intel": len(intel_list), "coverage": coverage, "vision": len(vision_pool) if vision_pool else 0, "ver": ver, "backup": bak, "rollback": rollback_path}
         cur.execute("INSERT INTO kv(scope,key,value) VALUES(?,?,?) ON CONFLICT(scope,key) DO UPDATE SET value=excluded.value", (KV_REMAP_SCOPE, KV_REMAP_KEY, json.dumps(remap_state)))
         for name, lst in expected.items():
             row = cur.execute("SELECT models FROM combos WHERE name=?", (name,)).fetchone()

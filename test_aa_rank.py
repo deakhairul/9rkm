@@ -393,6 +393,62 @@ def test_stream_ok_plain_choices():
     assert key_manager._stream_ok('{"error": "nope", "choices": []}') is False
 
 
+def test_stream_ok_rejects_ghost_empty():
+    # Rute hantu oc/1.3: 200 tapi nol konten, 1 chunk delta kosong + stop.
+    ghost_sse = 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}'
+    assert key_manager._stream_ok(ghost_sse) is False
+    ghost_body = '{"choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}]}'
+    assert key_manager._stream_ok(ghost_body) is False
+    assert key_manager._stream_ok('') is False
+    assert key_manager._stream_ok('data: [DONE]') is False
+
+
+def test_stream_ok_accepts_usage_only_evidence():
+    # bynara/1.2: delta kosong tapi usage completion 64 = bukti token keluar.
+    usage_sse = ('data: {"choices":[],"usage":{"completion_tokens":64,"prompt_tokens":761}}\n'
+                 'data: [DONE]')
+    assert key_manager._stream_ok(usage_sse) is True
+    body_usage = '{"choices":[{"message":{"content":"","role":"assistant"}}],"usage":{"completion_tokens":64}}'
+    assert key_manager._stream_ok(body_usage) is True
+
+
+def test_response_has_output_shapes():
+    assert aa_rank._response_has_output('{"choices":[{"message":{"content":"PONG"}}]}') is True
+    assert aa_rank._response_has_output('{"choices":[{"message":{"content":""}}]}') is False
+    assert aa_rank._response_has_output('{"choices":[{"message":{"content":"","reasoning_content":"think"}}]}') is True
+    assert aa_rank._response_has_output('{"choices":[{"message":{"content":"","reasoning_content":"None"}}]}') is False
+    assert aa_rank._response_has_output('{"choices":[{"message":{"content":""}}],"usage":{"completion_tokens":4}}') is True
+    assert aa_rank._response_has_output('{"error":{"message":"nope"}}') is False
+    assert aa_rank._response_has_output('bukan-json') is False
+
+
+def test_probe_empty_200_counts_as_empty():
+    import urllib.request as _urlreq
+    ghost = '{"choices":[{"message":{"content":"","role":"assistant"},"finish_reason":"stop"}]}'
+    healthy = '{"choices":[{"message":{"content":"PONG","role":"assistant"},"finish_reason":"stop"}]}'
+    bodies = {"ghost/x": ghost, "good/y": healthy}
+    real_urlopen = _urlreq.urlopen
+    class _Resp:
+        def __init__(self, body):
+            self.status = 200
+            self._body = body
+        def read(self):
+            return self._body.encode()
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+    def fake(req, timeout=None):
+        mid = __import__("json").loads(req.data.decode())["model"]
+        return _Resp(bodies[mid])
+    _urlreq.urlopen = fake
+    try:
+        assert aa_rank.probe_model("ghost/x", "k") == "empty"
+        assert aa_rank.probe_model("good/y", "k") == "ok"
+    finally:
+        _urlreq.urlopen = real_urlopen
+
+
 # (test_scan_cap DIHAPUS 2026-09-05: tidak ada scan — remap-only)
 
 

@@ -668,6 +668,44 @@ def _is_model_rejected(body):
     low = (body or "").lower()
     return any(m in low for m in MODEL_REJECT_MARKERS)
 
+def _response_has_output(body):
+    """True bila body chat-completion non-stream membawa bukti output nyata.
+
+    Menolak rute hantu 200-kosong (content '', tanpa reasoning, completion 0)
+    seperti oc/muse-spark-1.3 (09-2026): HTTP 200 tapi nol token.
+    Bukti yang diterima: content non-kosong (string/parts) ATAU
+    reasoning_content nyata (bukan string "None") ATAU completion_tokens > 0
+    (menyelamatkan bynara/1.2 yang content-nya kosong tapi 64 token terpakai).
+    Kembaran fungsi ini ada di key_manager._sse_or_body_has_output.
+    """
+    try:
+        d = json.loads(body) if isinstance(body, str) else body
+    except Exception:
+        return False
+    if not isinstance(d, dict):
+        return False
+    choices = d.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return False
+    msg = choices[0].get("message") or {}
+    if not isinstance(msg, dict):
+        return False
+    content = msg.get("content")
+    if isinstance(content, str) and content.strip():
+        return True
+    if isinstance(content, list) and any(
+            isinstance(p, dict) and str(p.get("text", "")).strip() for p in content):
+        return True
+    reasoning = msg.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning.strip() and reasoning.strip().lower() != "none":
+        return True
+    try:
+        if float((d.get("usage") or {}).get("completion_tokens") or 0) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
 def probe_model(mid, api_key, timeout=PROBE_TIMEOUT):
     if not api_key:
         return "fail"
@@ -675,8 +713,11 @@ def probe_model(mid, api_key, timeout=PROBE_TIMEOUT):
     try:
         req = urllib.request.Request(ROUTER_API, data=payload.encode(), headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=timeout) as response:
-            response.read()
-            return "ok" if 200 <= response.status < 300 else "down"
+            raw = response.read().decode("utf-8", "replace")
+            if not (200 <= response.status < 300):
+                return "down"
+            # Guard rute hantu: 2xx tanpa output = down (status "empty" agar jejak jelas di log)
+            return "ok" if _response_has_output(raw) else "empty"
     except urllib.error.HTTPError as error:
         try:
             body = error.read().decode("utf-8", "replace")

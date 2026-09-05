@@ -227,22 +227,66 @@ def _router_api_key():
         conn.close()
 
 
-def _stream_ok(raw):
-    # SSE stream: first content-bearing data chunk decides (responses-kind
-    # models return empty body with stream:false, so stream:true is required).
-    if "data:" in raw:
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line.startswith("data:"):
+def _sse_or_body_has_output(raw):
+    """Guard rute hantu untuk E2E (kembaran aa_rank._response_has_output).
+
+    Kumpulkan bukti output dari SEMUA chunk: delta.content, delta.reasoning_content,
+    message.content (non-stream), dan usage.completion_tokens (chunk usage-only
+    tanpa choices, mis. tokenrouter/bynara). Tolak bila total nol bukti —
+    mis. oc/1.3: 1 chunk delta kosong + stop, tanpa usage.
+    """
+    text_parts = []
+    completion = 0
+    saw_data = False
+    is_sse = "data:" in raw
+    lines = raw.splitlines() if is_sse else [raw]
+    for line in lines:
+        chunk = line.strip()
+        if is_sse:
+            if not chunk.startswith("data:"):
                 continue
-            data = line[5:].strip()
-            if not data or data == "[DONE]":
+            chunk = chunk[5:].strip()
+            if not chunk or chunk == "[DONE]":
                 continue
-            if "error" in data and "delta" not in data and "choices" not in data:
+        saw_data = True
+        try:
+            d = json.loads(chunk)
+        except Exception:
+            if "error" in chunk and "delta" not in chunk and "choices" not in chunk:
                 return False
-            return True
+            continue
+        if not isinstance(d, dict):
+            continue
+        if "error" in d and "delta" not in d and "choices" not in d:
+            return False
+        for choice in (d.get("choices") or []):
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta") or choice.get("message") or {}
+            if not isinstance(delta, dict):
+                continue
+            content = delta.get("content")
+            if isinstance(content, str) and content.strip():
+                text_parts.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and str(part.get("text", "")).strip():
+                        text_parts.append(str(part["text"]))
+            reasoning = delta.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning.strip() and reasoning.strip().lower() != "none":
+                text_parts.append(reasoning)
+        try:
+            completion = max(completion, float((d.get("usage") or {}).get("completion_tokens") or 0))
+        except (TypeError, ValueError):
+            pass
+    if not saw_data:
         return False
-    return '"choices"' in raw and '"error"' not in raw[:500]
+    return bool(text_parts) or completion > 0
+
+
+def _stream_ok(raw):
+    # E2E stream:true wajib (responses-kind buta saat stream:false) + bukti output nyata.
+    return _sse_or_body_has_output(raw)
 
 
 def _probe_combo(name):

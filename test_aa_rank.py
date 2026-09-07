@@ -116,8 +116,7 @@ def test_model_lock_prefilter_requires_all_keys_locked():
 
 
 def test_no_key_writers_remap_only():
-    # Remap-only 2026-09-05: 9RKM tidak boleh menulis providerConnections.isActive,
-    # tidak ada scan/reset/bulk/toggle, tidak ada endpoint on/off key.
+    # RENOVASI 2026-09-08: watchdog fresh-OFF + auto-ON DIIZINKAN; scan/reset/bulk/toggle lama tetap dilarang.
     import inspect
     assert not hasattr(key_manager, "run_scan_tick")
     assert not hasattr(key_manager, "run_reset")
@@ -128,11 +127,55 @@ def test_no_key_writers_remap_only():
     assert not hasattr(key_manager, "candidates_from_error_code")
     assert not hasattr(key_manager, "reset_cycle_thread")
     assert hasattr(key_manager, "remap_scheduler_thread")
+    assert hasattr(key_manager, "watchdog_thread")
+    assert hasattr(key_manager, "_fresh_error_ids")
+    assert hasattr(key_manager, "_auto_on_all")
     src = inspect.getsource(key_manager)
-    assert "isActive = 0" not in src, "dilarang mematikan key"
-    assert "isActive = 1" not in src, "dilarang menyalakan key"
     assert "/api/toggle" not in src
     assert "/api/keys/" not in src
+
+
+def test_watchdog_fresh_5s_only():
+    import sqlite3 as _sqlite3
+    import tempfile as _tempfile
+    import os as _os
+    import json as _json
+    import datetime as _dt
+    tmp = _tempfile.mkdtemp()
+    db = _os.path.join(tmp, "w.sqlite")
+    now = _dt.datetime.now(_dt.timezone.utc)
+    fresh = (now - _dt.timedelta(seconds=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    stale = (now - _dt.timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    conn = _sqlite3.connect(db)
+    conn.row_factory = _sqlite3.Row
+    conn.execute("CREATE TABLE providerConnections(id TEXT, data TEXT, isActive INT)")
+    conn.execute("INSERT INTO providerConnections VALUES('fresh', ?, 1)", (_json.dumps({"errorCode": 429, "lastErrorAt": fresh}),))
+    conn.execute("INSERT INTO providerConnections VALUES('stale', ?, 1)", (_json.dumps({"errorCode": 429, "lastErrorAt": stale}),))
+    conn.execute("INSERT INTO providerConnections VALUES('noat', ?, 1)", (_json.dumps({"errorCode": 429}),))
+    conn.execute("INSERT INTO providerConnections VALUES('ok', ?, 1)", (_json.dumps({}),))
+    conn.commit()
+    try:
+        ids = key_manager._fresh_error_ids(conn, now)
+        assert ids == ["fresh"], f"hanya fresh<=5s, dapat {ids}"
+    finally:
+        conn.close()
+        import shutil as _shutil
+        _shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_reorder_all_combos_no_delete():
+    models = ["b/x", "a/y"]
+    score_of = lambda m: {"a/y": 60.0, "b/x": 50.0}.get(m)
+    out = aa_rank._score_combo_models(models, score_of)
+    assert out == ["a/y", "b/x"]
+    out2 = aa_rank._score_combo_models(["b/x", "zzz/unknown"], score_of)
+    assert out2 == ["b/x", "zzz/unknown"]
+
+
+def test_effort_distinct_suffix():
+    assert aa_rank._route_effort_suffix("ag/gemini-3.8-flash-high") == "high"
+    assert aa_rank._route_effort_suffix("ag/gemini-3.8-flash") == ""
+    assert aa_rank._route_effort_suffix("cx/gpt-6-astra") == ""
 
 
 def test_eligibility_includes_disabled_connections():

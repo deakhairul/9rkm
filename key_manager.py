@@ -504,6 +504,83 @@ def _check_version_changed():
 def _due_schedule():
     return _cycle_state().get("successCycle") != get_cycle_id()
 
+WATCHDOG_SEC = 5
+ERROR_FRESH_SEC = 5
+
+def _fresh_error_ids(conn, now=None):
+    """Key aktif dengan lastErrorAt valid umur 0-5 dtk. Bukan updatedAt."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    out = []
+    for row in conn.execute("SELECT id, data FROM providerConnections WHERE isActive = 1").fetchall():
+        try:
+            d = json.loads(row["data"]) if row["data"] else {}
+        except Exception:
+            continue
+        if not isinstance(d, dict) or d.get("errorCode") is None:
+            continue
+        try:
+            err_at = datetime.datetime.fromisoformat(str(d.get("lastErrorAt")).replace("Z", "+00:00"))
+        except Exception:
+            continue
+        age = (now - err_at).total_seconds()
+        if 0 <= age <= ERROR_FRESH_SEC:
+            out.append(row["id"])
+    return out
+
+def _watchdog_tick():
+    conn = get_db()
+    try:
+        ids = _fresh_error_ids(conn)
+        if not ids:
+            return 0
+        now = get_iso_now()
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        for cid in ids:
+            cur.execute("UPDATE providerConnections SET isActive = 0, updatedAt = ? WHERE id = ?", (now, cid))
+        conn.commit()
+        log(f"[Watchdog] OFF {len(ids)} key error fresh<=5s.")
+        return len(ids)
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        log(f"[Watchdog] gagal {e}")
+        return 0
+    finally:
+        conn.close()
+
+def _auto_on_all():
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute("UPDATE providerConnections SET isActive = 1, updatedAt = ? WHERE isActive = 0", (get_iso_now(),))
+        n = cur.rowcount
+        conn.commit()
+        if n:
+            log(f"[Auto-ON] {n} key ON kembali (siklus 5 jam).")
+        return n
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        log(f"[Auto-ON] gagal {e}")
+        return 0
+    finally:
+        conn.close()
+
+def watchdog_thread():
+    while True:
+        try:
+            if _engine_enabled():
+                _watchdog_tick()
+        except Exception as e:
+            log(f"[-] Watchdog error: {e}")
+        time.sleep(WATCHDOG_SEC)
+
 def remap_scheduler_thread():
     fails = 0
     last_ver_check = 0
@@ -513,6 +590,7 @@ def remap_scheduler_thread():
                 time.sleep(SCHED_TICK_SEC)
                 continue
             if _due_schedule():
+                _auto_on_all()
                 code = _run_remap(reason="schedule")
                 last_ver_check = 0
             else:
@@ -1007,6 +1085,7 @@ def main():
     log("=== 9RKM remap-only started (scan/reset/toggle/bulk dihapus 2026-09-05) ===")
     threads = [
         threading.Thread(target=remap_scheduler_thread, daemon=True),
+        threading.Thread(target=watchdog_thread, daemon=True),
         threading.Thread(target=http_thread, daemon=True),
     ]
     for t in threads:

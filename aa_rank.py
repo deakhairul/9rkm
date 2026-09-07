@@ -224,12 +224,27 @@ def route_identity_candidates(mid):
                 out.append(item)
     return out
 
+def _route_effort_suffix(mid):
+    """Suffix effort dari route id: 'ag/gemini-3.8-flash-high' -> 'high', polos -> ''."""
+    last = (mid or "").rsplit("/", 1)[-1].lower()
+    for effort in ("extra-low", "xhigh", "high", "medium", "low", "max"):
+        if last.endswith("-" + effort):
+            return effort
+    return ""
+
 def resolve_aa_row(mid, aliases, by_name, by_slug, by_base=None):
     label = aliases.get(mid)
     if label and label in by_name:
         return by_name[label]
     if label and by_base is not None and base_model_name(label) in by_base:
         return by_base[base_model_name(label)]
+    effort = _route_effort_suffix(mid)
+    if effort and by_name is not None:
+        route_base = re.sub(r"-(?:extra-low|xhigh|high|medium|low|max)$", "",
+                            normalize_model_id((mid.split("/", 1)[1] if "/" in mid else mid)))
+        for name, row in by_name.items():
+            if normalize_model_id(base_model_name(name)) == route_base and name.lower().endswith(f"({effort})"):
+                return row
     for candidate in route_identity_candidates(mid):
         if candidate in by_slug:
             return by_slug[candidate]
@@ -894,6 +909,38 @@ COVERAGE_TOPK = 20
 COVERAGE_MIN_PCT = 70.0
 
 
+def _score_combo_models(models, score_of):
+    scored, noscore = [], []
+    for mid in models or []:
+        sc = score_of(mid)
+        if isinstance(sc, (int, float)):
+            scored.append((mid, float(sc)))
+        else:
+            noscore.append(mid)
+    scored.sort(key=lambda x: (-x[1], 0 if model_is_free({"id": x[0]}) else 1, 0 if not _is_review_mid(x[0]) else 1, x[0]))
+    return [m for m, _ in scored] + noscore
+
+def _reorder_all_combos(conn, score_of, groups):
+    """Reorder SEMUA combo (tanpa tambah/hapus) + gap-fill 1 model/provider absen per-combo.
+    gap-fill: provider nol di combo -> kandidat skor tertinggi grup itu + probe dikerjakan pemanggil."""
+    rows = conn.execute("SELECT name, models FROM combos").fetchall()
+    out = {}
+    for name, raw in rows:
+        try:
+            models = json.loads(raw) if raw else []
+        except Exception:
+            models = []
+        if not isinstance(models, list):
+            models = []
+        present = {(str(m).split("/", 1)[0] if "/" in str(m) else str(m)).lower() for m in models}
+        adds = []
+        for prov in sorted(set(groups) - present):
+            cands = groups.get(prov, [])
+            if cands:
+                adds.append(cands[0]["mid"])
+        out[name] = _score_combo_models(list(models) + adds, score_of)
+    return out
+
 def _coverage_report(intel_map, intel_groups, probe_cache, topk=COVERAGE_TOPK):
     """Cakupan label skor-top yang punya >=1 kandidat lolos probe.
     Mencegah kasus Muse Spark 1.3: skor 61-62 absen dari combo tanpa peringatan."""
@@ -1052,15 +1099,40 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
         pass
     rollback_path = db_path + f".combo-rollback-{ts}.json"
     previous_rows = {}
-    for combo_name in (COMBO_INTEL,):
-        row = cur.execute("SELECT models FROM combos WHERE name=?", (combo_name,)).fetchone()
-        previous_rows[combo_name] = json.loads(row[0]) if row and row[0] else None
+    for combo_row in cur.execute("SELECT name, models FROM combos").fetchall():
+        try:
+            previous_rows[combo_row[0]] = json.loads(combo_row[1]) if combo_row[1] else None
+        except Exception:
+            previous_rows[combo_row[0]] = None
     pathlib.Path(rollback_path).write_text(json.dumps(previous_rows, indent=2), encoding="utf-8")
     os.chmod(rollback_path, 0o600)
     log(f"[aa_rank] combo rollback {rollback_path}")
+    mid_score = {}
+    for prov, cands in intel_groups.items():
+        for cand in cands:
+            if isinstance(cand.get("score"), (int, float)):
+                st = probe_cache.get(cand["mid"])
+                if st == "ok" and cand["mid"] not in mid_score:
+                    mid_score[cand["mid"]] = cand["score"]
+    def score_of(mid):
+        if mid in mid_score:
+            return mid_score[mid]
+        for prov, cands in intel_groups.items():
+            for cand in cands:
+                if cand["mid"] == mid and isinstance(cand.get("score"), (int, float)):
+                    return cand["score"]
+        intel_label = None
+        for prov, cands in intel_groups.items():
+            for cand in cands:
+                if cand["mid"] == mid:
+                    intel_label = cand.get("label")
+                    break
+        if intel_label and intel_label in intel_map:
+            return intel_map[intel_label]
+        return None
+    expected = _reorder_all_combos(conn, score_of, intel_groups)
     try:
         cur.execute("BEGIN IMMEDIATE")
-        expected = {COMBO_INTEL: intel_list}
         for name, lst in expected.items():
             cur.execute("UPDATE combos SET models = ? WHERE name = ?", (json.dumps(lst), name))
             if cur.rowcount == 0:
@@ -1070,7 +1142,7 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
             write_vision_adapter(conn, vision_pool)
         else:
             log("[aa_rank] vision unchanged")
-        remap_state = {"at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00","Z"), "source": source, "intel": len(intel_list), "coverage": coverage, "vision": len(vision_pool) if vision_pool else 0, "ver": ver, "backup": bak, "rollback": rollback_path}
+        remap_state = {"at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00","Z"), "source": source, "intel": len(intel_list), "coverage": coverage, "vision": len(vision_pool) if vision_pool else 0, "ver": ver, "backup": bak, "rollback": rollback_path, "combos": {n: len(v) for n, v in expected.items()}}
         cur.execute("INSERT INTO kv(scope,key,value) VALUES(?,?,?) ON CONFLICT(scope,key) DO UPDATE SET value=excluded.value", (KV_REMAP_SCOPE, KV_REMAP_KEY, json.dumps(remap_state)))
         for name, lst in expected.items():
             row = cur.execute("SELECT models FROM combos WHERE name=?", (name,)).fetchone()

@@ -508,10 +508,28 @@ WATCHDOG_SEC = 5
 ERROR_FRESH_SEC = 5
 
 def _fresh_error_ids(conn, now=None):
-    """Key aktif dengan lastErrorAt valid umur 0-5 dtk. Bukan updatedAt."""
+    """Key aktif dengan KEJADIAN error 0-5 dtk di requestDetails. Bukan stamp gateway.
+
+    Syarat OFF (semua harus lolos):
+    1. providerConnections.data.errorCode ada + lastErrorAt valid umur 0-5 dtk, dan
+    2. ada baris requestDetails connectionId sama, status != 'success', timestamp 0-5 dtk.
+    Error >5 dtk = anggap tidak error. Tanpa tabel requestDetails = tidak ada bukti = [].
+    """
     now = now or datetime.datetime.now(datetime.timezone.utc)
+    cutoff = (now - datetime.timedelta(seconds=ERROR_FRESH_SEC)).strftime("%Y-%m-%dT%H:%M:%S.") + f"{(now - datetime.timedelta(seconds=ERROR_FRESH_SEC)).microsecond // 1000:03d}Z"
+    now_iso = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+    try:
+        fresh_cids = {r[0] for r in conn.execute(
+            "SELECT DISTINCT connectionId FROM requestDetails WHERE status != 'success' AND timestamp >= ? AND timestamp <= ? AND connectionId IS NOT NULL",
+            (cutoff, now_iso)).fetchall() if r[0]}
+    except Exception:
+        return []
+    if not fresh_cids:
+        return []
     out = []
     for row in conn.execute("SELECT id, data FROM providerConnections WHERE isActive = 1").fetchall():
+        if row["id"] not in fresh_cids:
+            continue
         try:
             d = json.loads(row["data"]) if row["data"] else {}
         except Exception:
@@ -993,7 +1011,18 @@ class RkmHandler(http.server.BaseHTTPRequestHandler):
                 return
             st = _set_engine_enabled(body["enabled"])
             log(f"[WebUI] engine {'ON' if st['enabled'] else 'OFF'}.")
-            self._json(200, {"ok": True, "engine": {"enabled": st["enabled"], "at": st.get("at")}})
+            extra = {}
+            if st["enabled"]:
+                try:
+                    extra["auto_on"] = _auto_on_all()
+                except Exception as e:
+                    extra["auto_on_error"] = str(e)[:120]
+                try:
+                    _run_remap_async(force=True, reason="engine-on")
+                    extra["remap"] = "started"
+                except Exception as e:
+                    extra["remap_error"] = str(e)[:120]
+            self._json(200, {"ok": True, "engine": {"enabled": st["enabled"], "at": st.get("at")}, **extra})
             return
         if self.path.startswith("/api/alias/proposal"):
             try:

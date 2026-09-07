@@ -144,21 +144,54 @@ def test_watchdog_fresh_5s_only():
     tmp = _tempfile.mkdtemp()
     db = _os.path.join(tmp, "w.sqlite")
     now = _dt.datetime.now(_dt.timezone.utc)
-    fresh = (now - _dt.timedelta(seconds=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    stale = (now - _dt.timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    fmt = lambda dt: dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    fresh = fmt(now - _dt.timedelta(seconds=2))
+    stale = fmt(now - _dt.timedelta(seconds=60))
     conn = _sqlite3.connect(db)
     conn.row_factory = _sqlite3.Row
     conn.execute("CREATE TABLE providerConnections(id TEXT, data TEXT, isActive INT)")
+    conn.execute("CREATE TABLE requestDetails(id TEXT, timestamp TEXT, connectionId TEXT, status TEXT, data TEXT)")
     conn.execute("INSERT INTO providerConnections VALUES('fresh', ?, 1)", (_json.dumps({"errorCode": 429, "lastErrorAt": fresh}),))
     conn.execute("INSERT INTO providerConnections VALUES('stale', ?, 1)", (_json.dumps({"errorCode": 429, "lastErrorAt": stale}),))
     conn.execute("INSERT INTO providerConnections VALUES('noat', ?, 1)", (_json.dumps({"errorCode": 429}),))
     conn.execute("INSERT INTO providerConnections VALUES('ok', ?, 1)", (_json.dumps({}),))
+    conn.execute("INSERT INTO providerConnections VALUES('nostamp', ?, 1)", (_json.dumps({"errorCode": 429, "lastErrorAt": fresh}),))
+    conn.execute("INSERT INTO requestDetails VALUES('r1', ?, 'fresh', 'error', '{}')", (fresh,))
+    conn.execute("INSERT INTO requestDetails VALUES('r2', ?, 'stale', 'error', '{}')", (stale,))
+    conn.execute("INSERT INTO requestDetails VALUES('r3', ?, 'nostamp', 'success', '{}')", (fresh,))
     conn.commit()
     try:
         ids = key_manager._fresh_error_ids(conn, now)
-        assert ids == ["fresh"], f"hanya fresh<=5s, dapat {ids}"
+        assert ids == ["fresh"], f"hanya kejadian error<=5s, dapat {ids}"
     finally:
         conn.close()
+        import shutil as _shutil
+        _shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_engine_on_triggers_auto_on_and_remap():
+    import inspect
+    src = inspect.getsource(key_manager.RkmHandler.do_POST)
+    assert "_auto_on_all()" in src, "ON engine harus panggil auto-ON"
+    assert '_run_remap_async' in src and 'engine-on' in src, "ON engine harus picu reorder"
+
+
+def test_auto_on_all_reactivates():
+    km, db, tmp = _lifecycle_env()
+    try:
+        _mk_conn(db, "c1", active=0)
+        _mk_conn(db, "c2", active=0)
+        n = km._auto_on_all()
+        assert n == 2, f"auto-ON harus nyalakan semua, dapat {n}"
+        conn = _sqlite3.connect(db)
+        try:
+            off = conn.execute("SELECT COUNT(*) FROM providerConnections WHERE isActive = 0").fetchone()[0]
+            assert off == 0
+        finally:
+            conn.close()
+    finally:
+        _os.environ.pop("ROUTER_DB", None)
+        _os.environ.pop("RKM_UI_PATH", None)
         import shutil as _shutil
         _shutil.rmtree(tmp, ignore_errors=True)
 

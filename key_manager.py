@@ -35,6 +35,8 @@ VERSION_SCOPE = "aa_version"
 VERSION_KEY = "state"
 VERSION_CHECK_SEC = 3600
 VERSION_MIN_INTERVAL_SEC = 7200
+ENGINE_SCOPE = "rkm_engine"
+ENGINE_KEY = "state"
 AA_API_BASE = "https://artificialanalysis.ai/api/v2/language/models/free"
 AA_KEY_ENV = "AA_API_KEY"
 COMBO_NAMES = ("Artificial-Analysis-Intelligence-Index",)
@@ -423,6 +425,25 @@ def _save_version_state(state):
     finally:
         conn.close()
 
+def _engine_enabled():
+    conn = get_db()
+    try:
+        st = load_state_from_db(conn.cursor(), ENGINE_SCOPE, ENGINE_KEY)
+        return bool(st.get("enabled", True))
+    finally:
+        conn.close()
+
+def _set_engine_enabled(enabled):
+    conn = get_db()
+    try:
+        st = load_state_from_db(conn.cursor(), ENGINE_SCOPE, ENGINE_KEY)
+        st.update({"enabled": bool(enabled), "at": get_iso_now()})
+        save_state_to_db(conn.cursor(), st, ENGINE_SCOPE, ENGINE_KEY)
+        conn.commit()
+        return st
+    finally:
+        conn.close()
+
 def _fetch_aa_version(timeout=25):
     """Cek ringan: page=1 saja, baca intelligence_index_version. Hemat kuota."""
     key = _aa_api_key()
@@ -488,6 +509,9 @@ def remap_scheduler_thread():
     last_ver_check = 0
     while True:
         try:
+            if not _engine_enabled():
+                time.sleep(SCHED_TICK_SEC)
+                continue
             if _due_schedule():
                 code = _run_remap(reason="schedule")
                 last_ver_check = 0
@@ -703,7 +727,9 @@ def status_snapshot():
         cycle = {"nextAt": next_at, "remainingSec": remaining, "intervalSec": CYCLE_SECONDS, "wib": wib.strftime("%d %b %H:%M WIB")}
         remap = _remap_snapshot(cur)
         vst = load_state_from_db(cur, VERSION_SCOPE, VERSION_KEY)
+        eng = load_state_from_db(cur, ENGINE_SCOPE, ENGINE_KEY)
         return {
+            "engine": {"enabled": bool(eng.get("enabled", True)), "at": eng.get("at")},
             "total": total,
             "active": configured,
             "by_provider": by_prov,
@@ -850,6 +876,9 @@ class RkmHandler(http.server.BaseHTTPRequestHandler):
                 except Exception as e:
                     self._json(500, {"error": str(e)})
                 return
+            if not _engine_enabled():
+                self._json(423, {"ok": False, "reason": "engine-off", "msg": "9RKM OFF — ON kan dulu"})
+                return
             try:
                 ln = int(self.headers.get("Content-Length", 0))
                 body = json.loads(self.rfile.read(ln).decode()) if ln else {}
@@ -873,6 +902,20 @@ class RkmHandler(http.server.BaseHTTPRequestHandler):
                     pass
             _run_remap_async(force=force)
             self._json(202, {"ok": True, "force": force, "msg": "remap started"})
+            return
+        if self.path.startswith("/api/engine"):
+            try:
+                ln = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(ln).decode()) if ln else {}
+            except Exception:
+                self._json(400, {"error": "bad json"})
+                return
+            if "enabled" not in body or not isinstance(body.get("enabled"), bool):
+                self._json(400, {"error": "need {enabled:bool}"})
+                return
+            st = _set_engine_enabled(body["enabled"])
+            log(f"[WebUI] engine {'ON' if st['enabled'] else 'OFF'}.")
+            self._json(200, {"ok": True, "engine": {"enabled": st["enabled"], "at": st.get("at")}})
             return
         if self.path.startswith("/api/alias/proposal"):
             try:

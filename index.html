@@ -58,6 +58,10 @@
       </div>
       <span class="badge on" id="badge">REMAP AKTIF</span>
     </div>
+    <div class="bulk-row">
+      <button class="btn bulk on" id="bEngine">⏸ OFF kan 9RKM</button>
+    </div>
+    <div class="log" id="enginelog"></div>
   </div>
 
   <div class="card">
@@ -106,8 +110,17 @@ function render(s) {
   snap = s;
   $('ts').textContent = 'Update: ' + s.ts;
   const b = $('badge');
-  b.textContent = 'REMAP AKTIF';
-  b.className = 'badge on';
+  const eng = (s.engine && typeof s.engine.enabled === 'boolean') ? s.engine.enabled : true;
+  const be = $('bEngine');
+  if (eng) {
+    b.textContent = 'REMAP AKTIF';
+    b.className = 'badge on';
+    if (be) { be.textContent = '⏸ OFF kan 9RKM'; be.className = 'btn bulk on'; be.disabled = false; }
+  } else {
+    b.textContent = '9RKM OFF';
+    b.className = 'badge off';
+    if (be) { be.textContent = '▶ ON kan 9RKM'; be.className = 'btn bulk off'; be.disabled = false; }
+  }
   const verTxt = 'AA ' + (s.aaVersion || '-') + (s.aaVersionChanged ? ' (berubah — remap otomatis jalan)' : '');
   $('verinfo').textContent = verTxt + (s.versionCheck && s.versionCheck.at ? ' · cek ' + s.versionCheck.at : '') + (s.versionCheck && s.versionCheck.error ? ' · cek gagal: ' + s.versionCheck.error : '');
   (function(){const c=s.cycle; if(!c){ $('cycleinfo').textContent=''; return; } let rem=Math.max(0,c.remainingSec|0); const tick=()=>{let r=Math.max(0,rem--); let h=Math.floor(r/3600), m=Math.floor((r%3600)/60), s2=r%60; const pad=n=>String(n).padStart(2,'0'); const txt='⏰ Remap berikut: '+c.wib+' (in '+h+'j '+pad(m)+'m '+pad(s2)+'s)'; $('cycleinfo').textContent=txt; if(r<=0) $('cycleinfo').textContent+=' — refresh...';}; tick(); if(window._cycleTimer) clearInterval(window._cycleTimer); window._cycleTimer=setInterval(tick,1000);})();
@@ -151,13 +164,16 @@ function renderRemap(s){
   let txt='';
   if(r.ver) txt+=`AA ${r.ver} `;
   if(r.locked) txt+='⏳ remap sedang jalan… ';
+  const engOff = snap && snap.engine && snap.engine.enabled === false;
+  if(engOff) txt+='⏸ 9RKM OFF — jadwal+versi+remap pause. ';
   if(r.cooldownSec>0) txt+=`cooldown ${Math.ceil(r.cooldownSec/60)}m `;
   if(r.lastWib) txt+=`last ${r.lastWib} src=${r.source||'-'} Intel ${r.intel??'-'} Vision ${r.vision??'-'} | cache ${r.cacheAgeH!=null?r.cacheAgeH+'j':'-'} `+(r.coverage?`Cov ${r.coverage.pct}%${r.coverage.warn?' \u26a0':''} `:'');
   else if(r.cacheAt) txt+=`cache ${r.cacheAgeH}j `;
   el.textContent=txt;
   const btn=document.getElementById('bRemap');
-  if(btn) btn.disabled=!!r.locked|| (r.cooldownSec>0);
-  if(btn && r.cooldownSec>0) btn.title=`cooldown ${r.cooldownSec}s (force pakai checkbox)`;
+  if(btn) btn.disabled=!!r.locked|| (r.cooldownSec>0) || engOff;
+  if(btn && engOff) btn.title='9RKM OFF — ON kan dulu';
+  else if(btn && r.cooldownSec>0) btn.title=`cooldown ${r.cooldownSec}s (force pakai checkbox)`;
   else if(btn) btn.title='';
 }
 const _renderOrig2 = render;
@@ -184,6 +200,17 @@ async function doRemap(force){
   }
 }
 const _bRemap=document.getElementById('bRemap'); if(_bRemap) _bRemap.onclick=()=>{ const force=confirm('Force = tarik API 1x dulu (jika 429 fallback DB). OK=force, Cancel=pakai cache DB langsung'); doRemap(force); };
+async function doEngine(){
+  const curOn = !(snap && snap.engine && snap.engine.enabled === false);
+  if(curOn && !confirm('OFF kan 9RKM? Jadwal 5 jam + cek versi + remap manual pause. Status tetap bisa dilihat.')) return;
+  const el=document.getElementById('enginelog');
+  try{
+    const r=await api('/api/engine',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:!curOn})});
+    if(el) el.textContent='9RKM '+(r.engine.enabled?'ON':'OFF')+' @ '+(r.engine.at||'-');
+    await refresh();
+  }catch(e){ if(el) el.textContent='Gagal: '+e.message; }
+}
+const _bEngine=document.getElementById('bEngine'); if(_bEngine) _bEngine.onclick=doEngine;
 $('bAliasCheck').onclick = aliasCheck;
 async function aliasCheck(){
   const el=document.getElementById('aliaslog');

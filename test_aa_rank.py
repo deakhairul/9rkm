@@ -132,7 +132,17 @@ def test_no_key_writers_remap_only():
     assert hasattr(key_manager, "_auto_on_all")
     src = inspect.getsource(key_manager)
     assert "/api/toggle" not in src
-    assert "/api/keys/" not in src
+    assert "/api/keys/deactivate_all" not in src
+    assert "bulk_activate_all" not in src and "bulk_deactivate_all" not in src
+    assert "/api/keys/activate_all" in src, "tombol AKTIFKAN butuh endpoint activate-all"
+
+
+def test_activate_all_endpoint_exists():
+    import inspect
+    src = inspect.getsource(key_manager.RkmHandler.do_POST)
+    assert "/api/keys/activate_all" in src
+    assert "_auto_on_all()" in src
+    assert '"activated"' in src or "'activated'" in src
 
 
 def test_watchdog_fresh_5s_only():

@@ -1024,6 +1024,15 @@ class RkmHandler(http.server.BaseHTTPRequestHandler):
                     extra["remap_error"] = str(e)[:120]
             self._json(200, {"ok": True, "engine": {"enabled": st["enabled"], "at": st.get("at")}, **extra})
             return
+        if self.path.split("?")[0] == "/api/keys/activate_all":
+            try:
+                n = _auto_on_all()
+            except Exception as e:
+                self._json(500, {"error": str(e)[:200]})
+                return
+            log(f"[WebUI] activate-all {n} key.")
+            self._json(200, {"ok": True, "activated": n})
+            return
         if self.path.startswith("/api/alias/proposal"):
             try:
                 r = subprocess.run([sys.executable, os.path.join(UI_PATH, "alias_sync.py")],

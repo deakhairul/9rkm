@@ -74,7 +74,9 @@
     <div class="log" id="remaplog" style="margin-top:10px"></div>
     <div class="bulk-row">
       <button class="btn bulk remap" id="bRemap">🔄 REMAP COMBO</button>
+      <button class="btn bulk activate" id="bActivateAll">✅ AKTIFKAN SEMUA KEY</button>
     </div>
+    <div class="log" id="activatelog"></div>
     <table id="tbl"><tr><th>Provider</th><th>Aktif</th></tr></table>
     <div style="margin-top:14px;font-size:13px;font-weight:700">Detail Key</div>
     <div style="overflow-x:auto;max-height:60vh;overflow-y:auto;border:1px solid var(--line);border-radius:10px;margin-top:8px">
@@ -211,6 +213,19 @@ async function doEngine(){
   }catch(e){ if(el) el.textContent='Gagal: '+e.message; }
 }
 const _bEngine=document.getElementById('bEngine'); if(_bEngine) _bEngine.onclick=doEngine;
+async function doActivateAll(){
+  if(!confirm('Aktifkan SEMUA key (isActive=1)? Key error akan OFF lagi bila ada kejadian error fresh.')) return;
+  const btn=document.getElementById('bActivateAll');
+  const el=document.getElementById('activatelog');
+  if(btn) btn.disabled=true;
+  try{
+    const r=await api('/api/keys/activate_all',{method:'POST'});
+    if(el) el.textContent='✅ '+r.activated+' key ON kembali.';
+    await refresh();
+  }catch(e){ if(el) el.textContent='Gagal: '+e.message; }
+  finally{ if(btn) btn.disabled=false; }
+}
+const _bActivateAll=document.getElementById('bActivateAll'); if(_bActivateAll) _bActivateAll.onclick=doActivateAll;
 $('bAliasCheck').onclick = aliasCheck;
 async function aliasCheck(){
   const el=document.getElementById('aliaslog');

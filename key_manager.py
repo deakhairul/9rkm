@@ -2,11 +2,14 @@
 """
 9RKM - 9Router Key Manager, edisi remap-only (2026-09-05, amendemen PRD remap-only).
 Satu daemon remap combo model terbaik tiap siklus 5 jam + auto-remap saat versi
-AA Intelligence Index berubah:
-  - Thread scheduler: remap terjadwal 5 jam + cek versi ringan 1x/jam
-  - Thread HTTP      : Web UI status + REMAP manual + approve alias, Tailscale-only
-On/off key DIHAPUS TOTAL (scan 5s, reset, bulk, toggle): 9RKM tidak pernah menulis
-providerConnections.isActive. Saringan satu-satunya = probe 2xx saat remap.
+AA Intelligence Index berubah + watchdog auto-OFF key error fresh:
+  - Thread scheduler: remap terjadwal 5 jam + cek versi ringan 1x/jam (gate: reorder)
+  - Thread watchdog : OFF key error fresh<=5s + auto-ON tiap siklus 5 jam (gate: auto_off)
+  - Thread HTTP     : Web UI status + REMAP manual + approve alias, Tailscale-only
+Split toggle 2026-09-08 (PRD split-toggle): Auto Off Key dan Reorder Combo independen.
+On/off key DIHAPUS TOTAL kecuali watchdog fresh + auto-ON (lihat ADR 0004):
+9RKM tidak pernah menulis providerConnections.isActive selain dua jalur itu.
+Saringan combo satu-satunya = probe 2xx saat remap.
 Arsip versi on/off: riwayat git repo ini (pre-remap-only) + backup deploy §12.7.
 """
 import sys, os, time, json, sqlite3, datetime, threading
@@ -37,6 +40,8 @@ VERSION_CHECK_SEC = 3600
 VERSION_MIN_INTERVAL_SEC = 7200
 ENGINE_SCOPE = "rkm_engine"
 ENGINE_KEY = "state"
+ENGINE_AUTO_OFF_SCOPE = "rkm_engine_auto_off"
+ENGINE_REORDER_SCOPE = "rkm_engine_reorder"
 AA_API_BASE = "https://artificialanalysis.ai/api/v2/language/models/free"
 AA_KEY_ENV = "AA_API_KEY"
 COMBO_NAMES = ("Artificial-Analysis-Intelligence-Index",)
@@ -425,15 +430,107 @@ def _save_version_state(state):
     finally:
         conn.close()
 
-def _engine_enabled():
+def _legacy_engine_state():
     conn = get_db()
     try:
-        st = load_state_from_db(conn.cursor(), ENGINE_SCOPE, ENGINE_KEY)
-        return bool(st.get("enabled", True))
+        return load_state_from_db(conn.cursor(), ENGINE_SCOPE, ENGINE_KEY)
     finally:
         conn.close()
 
+
+def _auto_off_enabled():
+    """Toggle Auto Off Key: watchdog fresh-OFF + auto-ON siklus. Default ON; migrasi dari legacy rkm_engine."""
+    conn = get_db()
+    try:
+        st = load_state_from_db(conn.cursor(), ENGINE_AUTO_OFF_SCOPE, ENGINE_KEY)
+        if "enabled" in st:
+            return bool(st["enabled"])
+        leg = load_state_from_db(conn.cursor(), ENGINE_SCOPE, ENGINE_KEY)
+        if "enabled" in leg:
+            return bool(leg["enabled"])
+        return True
+    finally:
+        conn.close()
+
+
+def _reorder_enabled():
+    """Toggle Reorder Combo: jadwal remap 5 jam + cek versi + remap manual. Default ON; migrasi dari legacy rkm_engine."""
+    conn = get_db()
+    try:
+        st = load_state_from_db(conn.cursor(), ENGINE_REORDER_SCOPE, ENGINE_KEY)
+        if "enabled" in st:
+            return bool(st["enabled"])
+        leg = load_state_from_db(conn.cursor(), ENGINE_SCOPE, ENGINE_KEY)
+        if "enabled" in leg:
+            return bool(leg["enabled"])
+        return True
+    finally:
+        conn.close()
+
+
+def _auto_off_state():
+    conn = get_db()
+    try:
+        st = load_state_from_db(conn.cursor(), ENGINE_AUTO_OFF_SCOPE, ENGINE_KEY)
+        if "enabled" not in st:
+            leg = load_state_from_db(conn.cursor(), ENGINE_SCOPE, ENGINE_KEY)
+            if "enabled" in leg:
+                st = {"enabled": bool(leg["enabled"]), "at": leg.get("at"), "migrated_from": "rkm_engine"}
+        st.setdefault("enabled", True)
+        return st
+    finally:
+        conn.close()
+
+
+def _reorder_state():
+    conn = get_db()
+    try:
+        st = load_state_from_db(conn.cursor(), ENGINE_REORDER_SCOPE, ENGINE_KEY)
+        if "enabled" not in st:
+            leg = load_state_from_db(conn.cursor(), ENGINE_SCOPE, ENGINE_KEY)
+            if "enabled" in leg:
+                st = {"enabled": bool(leg["enabled"]), "at": leg.get("at"), "migrated_from": "rkm_engine"}
+        st.setdefault("enabled", True)
+        return st
+    finally:
+        conn.close()
+
+
+def _set_auto_off_enabled(enabled):
+    conn = get_db()
+    try:
+        st = load_state_from_db(conn.cursor(), ENGINE_AUTO_OFF_SCOPE, ENGINE_KEY)
+        st.update({"enabled": bool(enabled), "at": get_iso_now()})
+        st.pop("migrated_from", None)
+        save_state_to_db(conn.cursor(), st, ENGINE_AUTO_OFF_SCOPE, ENGINE_KEY)
+        conn.commit()
+        return st
+    finally:
+        conn.close()
+
+
+def _set_reorder_enabled(enabled):
+    conn = get_db()
+    try:
+        st = load_state_from_db(conn.cursor(), ENGINE_REORDER_SCOPE, ENGINE_KEY)
+        st.update({"enabled": bool(enabled), "at": get_iso_now()})
+        st.pop("migrated_from", None)
+        save_state_to_db(conn.cursor(), st, ENGINE_REORDER_SCOPE, ENGINE_KEY)
+        conn.commit()
+        return st
+    finally:
+        conn.close()
+
+
+def _engine_enabled():
+    """Kompat legacy: AND kedua toggle. UI lama yang baca engine.enabled tetap jujur (OFF bila salah satu OFF)."""
+    return bool(_auto_off_enabled() and _reorder_enabled())
+
+
 def _set_engine_enabled(enabled):
+    """Kompat legacy: set KEDUA toggle sekaligus (dipakai endpoint lama /api/engine)."""
+    a = _set_auto_off_enabled(enabled)
+    r = _set_reorder_enabled(enabled)
     conn = get_db()
     try:
         st = load_state_from_db(conn.cursor(), ENGINE_SCOPE, ENGINE_KEY)
@@ -602,22 +699,45 @@ def _auto_on_all():
 def watchdog_thread():
     while True:
         try:
-            if _engine_enabled() and not _watchdog_paused():
+            if _auto_off_enabled() and not _watchdog_paused():
                 _watchdog_tick()
         except Exception as e:
             log(f"[-] Watchdog error: {e}")
         time.sleep(WATCHDOG_SEC)
+
+def _maybe_auto_on_cycle():
+    """Auto-ON 1x per cycle_id bila toggle auto_off ON. Independen dari remap (split-toggle 2026-09-08)."""
+    try:
+        cid = get_cycle_id()
+        st = _cycle_state()
+        if st.get("lastAutoOnCycle") == cid:
+            return 0
+        n = _auto_on_all()
+        try:
+            _save_cycle_state({**_cycle_state(), "lastAutoOnCycle": cid})
+        except Exception:
+            pass
+        return n
+    except Exception as e:
+        log(f"[Auto-ON] siklus gagal {e}")
+        return 0
 
 def remap_scheduler_thread():
     fails = 0
     last_ver_check = 0
     while True:
         try:
-            if not _engine_enabled():
+            auto_on = _auto_off_enabled()
+            reorder_on = _reorder_enabled()
+            if not auto_on and not reorder_on:
+                time.sleep(SCHED_TICK_SEC)
+                continue
+            if auto_on:
+                _maybe_auto_on_cycle()
+            if not reorder_on:
                 time.sleep(SCHED_TICK_SEC)
                 continue
             if _due_schedule():
-                _auto_on_all()
                 code = _run_remap(reason="schedule")
                 last_ver_check = 0
             else:
@@ -835,8 +955,22 @@ def status_snapshot():
         remap = _remap_snapshot(cur)
         vst = load_state_from_db(cur, VERSION_SCOPE, VERSION_KEY)
         eng = load_state_from_db(cur, ENGINE_SCOPE, ENGINE_KEY)
+        ao = load_state_from_db(cur, ENGINE_AUTO_OFF_SCOPE, ENGINE_KEY)
+        ro = load_state_from_db(cur, ENGINE_REORDER_SCOPE, ENGINE_KEY)
+        if "enabled" not in ao and "enabled" in eng:
+            ao = {"enabled": bool(eng["enabled"]), "at": eng.get("at"), "migrated_from": "rkm_engine"}
+        if "enabled" not in ro and "enabled" in eng:
+            ro = {"enabled": bool(eng["enabled"]), "at": eng.get("at"), "migrated_from": "rkm_engine"}
+        ao.setdefault("enabled", True)
+        ro.setdefault("enabled", True)
+        auto_off = {"enabled": bool(ao.get("enabled", True)), "at": ao.get("at")}
+        reorder = {"enabled": bool(ro.get("enabled", True)), "at": ro.get("at")}
+        engine = {"enabled": bool(auto_off["enabled"] and reorder["enabled"]),
+                  "at": eng.get("at"), "auto_off": auto_off["enabled"], "reorder": reorder["enabled"]}
         return {
-            "engine": {"enabled": bool(eng.get("enabled", True)), "at": eng.get("at")},
+            "engine": engine,
+            "auto_off": auto_off,
+            "reorder": reorder,
             "total": total,
             "active": configured,
             "by_provider": by_prov,
@@ -901,8 +1035,12 @@ def tg_status_text():
     timer = f"Remap berikut: {c.get('wib','-')} (in {hh}j {mm}m)"
     r = s.get("remap") or {}
     ver = r.get("ver") or "-"
+    ao = (s.get("auto_off") or {}).get("enabled", True)
+    ro = (s.get("reorder") or {}).get("enabled", True)
     return (
         "⚙️ <b>9RKM — Remap Combo</b>\n\n"
+        f"Auto Off Key: {'🟢 ON' if ao else '🔴 OFF'}\n"
+        f"Reorder Combo: {'🟢 ON' if ro else '🔴 OFF'}\n"
         f"AA ver: {ver}\n"
         f"Key terkonfigurasi: <b>{s['active']}/{s['total']}</b>\n"
         f"Provider: {provs or '-'}\n"
@@ -983,8 +1121,8 @@ class RkmHandler(http.server.BaseHTTPRequestHandler):
                 except Exception as e:
                     self._json(500, {"error": str(e)})
                 return
-            if not _engine_enabled():
-                self._json(423, {"ok": False, "reason": "engine-off", "msg": "9RKM OFF — ON kan dulu"})
+            if not _reorder_enabled():
+                self._json(423, {"ok": False, "reason": "reorder-off", "msg": "REORDER OFF — ON kan Reorder Combo dulu"})
                 return
             try:
                 ln = int(self.headers.get("Content-Length", 0))
@@ -1010,6 +1148,47 @@ class RkmHandler(http.server.BaseHTTPRequestHandler):
             _run_remap_async(force=force)
             self._json(202, {"ok": True, "force": force, "msg": "remap started"})
             return
+        if self.path.startswith("/api/engine/auto_off"):
+            try:
+                ln = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(ln).decode()) if ln else {}
+            except Exception:
+                self._json(400, {"error": "bad json"})
+                return
+            if "enabled" not in body or not isinstance(body.get("enabled"), bool):
+                self._json(400, {"error": "need {enabled:bool}"})
+                return
+            st = _set_auto_off_enabled(body["enabled"])
+            log(f"[WebUI] auto_off {'ON' if st['enabled'] else 'OFF'}.")
+            extra = {}
+            if st["enabled"]:
+                try:
+                    extra["auto_on"] = _auto_on_all()
+                except Exception as e:
+                    extra["auto_on_error"] = str(e)[:120]
+            self._json(200, {"ok": True, "auto_off": {"enabled": st["enabled"], "at": st.get("at")}, **extra})
+            return
+        if self.path.startswith("/api/engine/reorder"):
+            try:
+                ln = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(ln).decode()) if ln else {}
+            except Exception:
+                self._json(400, {"error": "bad json"})
+                return
+            if "enabled" not in body or not isinstance(body.get("enabled"), bool):
+                self._json(400, {"error": "need {enabled:bool}"})
+                return
+            st = _set_reorder_enabled(body["enabled"])
+            log(f"[WebUI] reorder {'ON' if st['enabled'] else 'OFF'}.")
+            extra = {}
+            if st["enabled"]:
+                try:
+                    _run_remap_async(force=True, reason="engine-on")
+                    extra["remap"] = "started"
+                except Exception as e:
+                    extra["remap_error"] = str(e)[:120]
+            self._json(200, {"ok": True, "reorder": {"enabled": st["enabled"], "at": st.get("at")}, **extra})
+            return
         if self.path.startswith("/api/engine"):
             try:
                 ln = int(self.headers.get("Content-Length", 0))
@@ -1021,7 +1200,7 @@ class RkmHandler(http.server.BaseHTTPRequestHandler):
                 self._json(400, {"error": "need {enabled:bool}"})
                 return
             st = _set_engine_enabled(body["enabled"])
-            log(f"[WebUI] engine {'ON' if st['enabled'] else 'OFF'}.")
+            log(f"[WebUI] engine {'ON' if st['enabled'] else 'OFF'} (legacy: set auto_off+reorder).")
             extra = {}
             if st["enabled"]:
                 try:
@@ -1033,7 +1212,9 @@ class RkmHandler(http.server.BaseHTTPRequestHandler):
                     extra["remap"] = "started"
                 except Exception as e:
                     extra["remap_error"] = str(e)[:120]
-            self._json(200, {"ok": True, "engine": {"enabled": st["enabled"], "at": st.get("at")}, **extra})
+            snap = status_snapshot()
+            self._json(200, {"ok": True, "engine": snap["engine"], "auto_off": snap["auto_off"],
+                             "reorder": snap["reorder"], **extra})
             return
         if self.path.split("?")[0] == "/api/keys/activate_all":
             try:
@@ -1131,7 +1312,7 @@ def http_thread():
 # ---------- Main ----------
 
 def main():
-    log("=== 9RKM remap-only started (scan/reset/toggle/bulk dihapus 2026-09-05) ===")
+    log("=== 9RKM split-toggle started (auto_off + reorder independen 2026-09-08) ===")
     threads = [
         threading.Thread(target=remap_scheduler_thread, daemon=True),
         threading.Thread(target=watchdog_thread, daemon=True),

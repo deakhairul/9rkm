@@ -52,14 +52,29 @@
   <div class="card">
     <div class="row">
       <div>
-        <div style="font-size:14px;font-weight:700">Remap Combo (remap-only)</div>
+        <div style="font-size:14px;font-weight:700">Auto Off Key (watchdog 5s + auto-ON 5 jam)</div>
+        <div class="log">OFF-kan key error fresh ≤5 dtk, ON-kan kembali tiap siklus 5 jam.</div>
+        <div class="log" id="autooffinfo">-</div>
+      </div>
+      <span class="badge on" id="badgeAutoOff">AUTO-OFF AKTIF</span>
+    </div>
+    <div class="bulk-row">
+      <button class="btn bulk on" id="bAutoOff">⏸ OFF kan Auto Off</button>
+    </div>
+    <div class="log" id="autoofflog"></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <div style="font-size:14px;font-weight:700">Reorder Combo (remap-only)</div>
         <div class="log" id="verinfo">-</div>
       <div class="log" id="cycleinfo" style="margin-top:6px;font-weight:600"></div>
       </div>
       <span class="badge on" id="badge">REMAP AKTIF</span>
     </div>
     <div class="bulk-row">
-      <button class="btn bulk on" id="bEngine">⏸ OFF kan 9RKM</button>
+      <button class="btn bulk on" id="bEngine">⏸ OFF kan Reorder</button>
     </div>
     <div class="log" id="enginelog"></div>
   </div>
@@ -108,20 +123,43 @@ async function api(path, opts = {}) {
   return r.json();
 }
 
+function toggles(s){
+  const ao = (s.auto_off && typeof s.auto_off.enabled === 'boolean') ? s.auto_off.enabled
+    : (s.engine && typeof s.engine.auto_off === 'boolean' ? s.engine.auto_off
+    : (s.engine && typeof s.engine.enabled === 'boolean' ? s.engine.enabled : true));
+  const ro = (s.reorder && typeof s.reorder.enabled === 'boolean') ? s.reorder.enabled
+    : (s.engine && typeof s.engine.reorder === 'boolean' ? s.engine.reorder
+    : (s.engine && typeof s.engine.enabled === 'boolean' ? s.engine.enabled : true));
+  return {autoOff: ao, reorder: ro};
+}
+
 function render(s) {
   snap = s;
   $('ts').textContent = 'Update: ' + s.ts;
+  const t = toggles(s);
   const b = $('badge');
-  const eng = (s.engine && typeof s.engine.enabled === 'boolean') ? s.engine.enabled : true;
   const be = $('bEngine');
-  if (eng) {
+  if (t.reorder) {
     b.textContent = 'REMAP AKTIF';
     b.className = 'badge on';
-    if (be) { be.textContent = '⏸ OFF kan 9RKM'; be.className = 'btn bulk on'; be.disabled = false; }
+    if (be) { be.textContent = '⏸ OFF kan Reorder'; be.className = 'btn bulk on'; be.disabled = false; }
   } else {
-    b.textContent = '9RKM OFF';
+    b.textContent = 'REORDER OFF';
     b.className = 'badge off';
-    if (be) { be.textContent = '▶ ON kan 9RKM'; be.className = 'btn bulk off'; be.disabled = false; }
+    if (be) { be.textContent = '▶ ON kan Reorder'; be.className = 'btn bulk off'; be.disabled = false; }
+  }
+  const ba = $('badgeAutoOff');
+  const bao = $('bAutoOff');
+  if (ba) { ba.textContent = t.autoOff ? 'AUTO-OFF AKTIF' : 'AUTO-OFF OFF'; ba.className = 'badge ' + (t.autoOff ? 'on' : 'off'); }
+  if (bao) {
+    bao.textContent = t.autoOff ? '⏸ OFF kan Auto Off' : '▶ ON kan Auto Off';
+    bao.className = 'btn bulk ' + (t.autoOff ? 'on' : 'off');
+    bao.disabled = false;
+  }
+  const aoInfo = $('autooffinfo');
+  if (aoInfo) {
+    const a = s.auto_off || {};
+    aoInfo.textContent = t.autoOff ? ('aktif' + (a.at ? ' · sejak ' + a.at : '')) : ('OFF' + (a.at ? ' · sejak ' + a.at : '') + ' — watchdog + auto-ON pause');
   }
   const verTxt = 'AA ' + (s.aaVersion || '-') + (s.aaVersionChanged ? ' (berubah — remap otomatis jalan)' : '');
   $('verinfo').textContent = verTxt + (s.versionCheck && s.versionCheck.at ? ' · cek ' + s.versionCheck.at : '') + (s.versionCheck && s.versionCheck.error ? ' · cek gagal: ' + s.versionCheck.error : '');
@@ -166,17 +204,20 @@ function renderRemap(s){
   let txt='';
   if(r.ver) txt+=`AA ${r.ver} `;
   if(r.locked) txt+='⏳ remap sedang jalan… ';
-  const engOff = snap && snap.engine && snap.engine.enabled === false;
-  if(engOff) txt+='⏸ 9RKM OFF — jadwal+versi+remap pause. ';
+  const t = toggles(snap || s);
+  if(!t.reorder) txt+='⏸ REORDER OFF — jadwal+versi+remap pause. ';
+  if(!t.autoOff) txt+='⏸ AUTO-OFF OFF — watchdog + auto-ON pause. ';
   if(r.cooldownSec>0) txt+=`cooldown ${Math.ceil(r.cooldownSec/60)}m `;
-  if(r.lastWib) txt+=`last ${r.lastWib} src=${r.source||'-'} Intel ${r.intel??'-'} Vision ${r.vision??'-'} | cache ${r.cacheAgeH!=null?r.cacheAgeH+'j':'-'} `+(r.coverage?`Cov ${r.coverage.pct}%${r.coverage.warn?' \u26a0':''} `:'');
+  if(r.lastWib) txt+=`last ${r.lastWib} src=${r.source||'-'} Intel ${r.intel??'-'} Vision ${r.vision??'-'} | cache ${r.cacheAgeH!=null?r.cacheAgeH+'j':'-'} `+(r.coverage?`Cov ${r.coverage.pct}%${r.coverage.warn?' ⚠':''} `:'');
   else if(r.cacheAt) txt+=`cache ${r.cacheAgeH}j `;
   el.textContent=txt;
   const btn=document.getElementById('bRemap');
-  if(btn) btn.disabled=!!r.locked|| (r.cooldownSec>0) || engOff;
-  if(btn && engOff) btn.title='9RKM OFF — ON kan dulu';
+  if(btn) btn.disabled=!!r.locked|| (r.cooldownSec>0) || !t.reorder;
+  if(btn && !t.reorder) btn.title='REORDER OFF — ON kan Reorder dulu';
   else if(btn && r.cooldownSec>0) btn.title=`cooldown ${r.cooldownSec}s (force pakai checkbox)`;
   else if(btn) btn.title='';
+  const bAct=document.getElementById('bActivateAll');
+  if(bAct) { bAct.disabled=false; bAct.title='Manual — selalu boleh, tidak ikut toggle'; }
 }
 const _renderOrig2 = render;
 render = function(s){_renderOrig2(s);renderRemap(s)}
@@ -202,17 +243,30 @@ async function doRemap(force){
   }
 }
 const _bRemap=document.getElementById('bRemap'); if(_bRemap) _bRemap.onclick=()=>{ const force=confirm('Force = tarik API 1x dulu (jika 429 fallback DB). OK=force, Cancel=pakai cache DB langsung'); doRemap(force); };
-async function doEngine(){
-  const curOn = !(snap && snap.engine && snap.engine.enabled === false);
-  if(curOn && !confirm('OFF kan 9RKM? Jadwal 5 jam + cek versi + remap manual pause. Status tetap bisa dilihat.')) return;
-  const el=document.getElementById('enginelog');
+async function doAutoOff(){
+  const t = toggles(snap || {});
+  if(t.autoOff && !confirm('OFF kan Auto Off Key? Watchdog 5 dtk + auto-ON 5 jam pause. Reorder tidak ikut. Status tetap bisa dilihat.')) return;
+  const el=document.getElementById('autoofflog');
   try{
-    const r=await api('/api/engine',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:!curOn})});
-    if(el) el.textContent='9RKM '+(r.engine.enabled?'ON':'OFF')+' @ '+(r.engine.at||'-');
+    const r=await api('/api/engine/auto_off',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:!t.autoOff})});
+    const st = r.auto_off || {};
+    if(el) el.textContent='Auto Off '+(st.enabled?'ON':'OFF')+' @ '+(st.at||'-')+(r.auto_on!=null?(' · auto-ON '+r.auto_on+' key'):'');
     await refresh();
   }catch(e){ if(el) el.textContent='Gagal: '+e.message; }
 }
-const _bEngine=document.getElementById('bEngine'); if(_bEngine) _bEngine.onclick=doEngine;
+async function doReorder(){
+  const t = toggles(snap || {});
+  if(t.reorder && !confirm('OFF kan Reorder Combo? Jadwal 5 jam + cek versi + remap manual pause. Auto Off tidak ikut. Status tetap bisa dilihat.')) return;
+  const el=document.getElementById('enginelog');
+  try{
+    const r=await api('/api/engine/reorder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:!t.reorder})});
+    const st = r.reorder || {};
+    if(el) el.textContent='Reorder '+(st.enabled?'ON':'OFF')+' @ '+(st.at||'-')+(r.remap?(' · remap '+r.remap):'');
+    await refresh();
+  }catch(e){ if(el) el.textContent='Gagal: '+e.message; }
+}
+const _bEngine=document.getElementById('bEngine'); if(_bEngine) _bEngine.onclick=doReorder;
+const _bAutoOff=document.getElementById('bAutoOff'); if(_bAutoOff) _bAutoOff.onclick=doAutoOff;
 async function doActivateAll(){
   if(!confirm('Aktifkan SEMUA key (isActive=1)? Key error akan OFF lagi bila ada kejadian error fresh.')) return;
   const btn=document.getElementById('bActivateAll');

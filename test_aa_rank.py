@@ -652,6 +652,70 @@ def test_rollback_marks_visible_state_truthful():
         _shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_split_toggle_scopes_exist():
+    import inspect
+    assert hasattr(key_manager, "_auto_off_enabled")
+    assert hasattr(key_manager, "_reorder_enabled")
+    assert hasattr(key_manager, "_set_auto_off_enabled")
+    assert hasattr(key_manager, "_set_reorder_enabled")
+    assert hasattr(key_manager, "_maybe_auto_on_cycle")
+    assert key_manager.ENGINE_AUTO_OFF_SCOPE == "rkm_engine_auto_off"
+    assert key_manager.ENGINE_REORDER_SCOPE == "rkm_engine_reorder"
+    src = inspect.getsource(key_manager.RkmHandler.do_POST)
+    assert "/api/engine/auto_off" in src, "endpoint Auto Off wajib ada"
+    assert "/api/engine/reorder" in src, "endpoint Reorder wajib ada"
+    assert "reorder-off" in src, "gate remap harus reorder-off"
+    assert "_reorder_enabled()" in src
+    assert "_set_auto_off_enabled" in src and "_set_reorder_enabled" in src
+    assert "_auto_on_all" in src and "_run_remap_async" in src
+    wsrc = inspect.getsource(key_manager.watchdog_thread)
+    assert "_auto_off_enabled()" in wsrc, "watchdog ikut Auto Off"
+    assert "_engine_enabled()" not in wsrc, "watchdog tidak boleh pakai toggle global"
+    ssrc = inspect.getsource(key_manager.remap_scheduler_thread)
+    assert "_auto_off_enabled()" in ssrc and "_reorder_enabled()" in ssrc
+    assert "_maybe_auto_on_cycle()" in ssrc, "auto-ON ikut siklus Auto Off"
+
+
+def test_split_toggle_independent_lifecycle():
+    km, db, tmp = _lifecycle_env()
+    try:
+        assert km._auto_off_enabled() is True
+        assert km._reorder_enabled() is True
+        km._set_auto_off_enabled(False)
+        assert km._auto_off_enabled() is False
+        assert km._reorder_enabled() is True, "matikan Auto Off tidak boleh matikan Reorder"
+        snap = km.status_snapshot()
+        assert snap["auto_off"]["enabled"] is False
+        assert snap["reorder"]["enabled"] is True
+        assert snap["engine"]["enabled"] is False, "engine legacy = AND"
+        km._set_reorder_enabled(False)
+        assert km._engine_enabled() is False
+        km._set_auto_off_enabled(True)
+        km._set_reorder_enabled(True)
+        assert km._engine_enabled() is True
+        snap2 = km.status_snapshot()
+        assert snap2["auto_off"]["enabled"] is True and snap2["reorder"]["enabled"] is True
+    finally:
+        _os.environ.pop("ROUTER_DB", None)
+        import shutil as _shutil
+        _shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_auto_on_cycle_once_per_cycle():
+    km, db, tmp = _lifecycle_env()
+    try:
+        _mk_conn(db, "c1", active=0)
+        _mk_conn(db, "c2", active=0)
+        n1 = km._maybe_auto_on_cycle()
+        assert n1 == 2, f"auto-ON pertama harus 2, dapat {n1}"
+        n2 = km._maybe_auto_on_cycle()
+        assert n2 == 0, f"panggil kedua siklus sama harus 0, dapat {n2}"
+    finally:
+        _os.environ.pop("ROUTER_DB", None)
+        import shutil as _shutil
+        _shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:

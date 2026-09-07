@@ -215,6 +215,34 @@ def test_reorder_all_combos_no_delete():
     assert out2 == ["b/x", "zzz/unknown"]
 
 
+def test_reorder_gapfill_probe_ok_only():
+    import sqlite3 as _sqlite3
+    conn = _sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE combos(name TEXT, models TEXT)")
+    conn.execute("INSERT INTO combos VALUES('C1', '[\"a/low\"]')")
+    groups = {
+        "a": [{"mid": "a/low", "score": 10.0}],
+        "b": [{"mid": "b/dead", "score": 90.0}, {"mid": "b/live", "score": 80.0}],
+    }
+    score_of = lambda m: {"a/low": 10.0, "b/dead": 90.0, "b/live": 80.0}.get(m)
+    out = aa_rank._reorder_all_combos(conn, score_of, groups, {"b/dead": "down", "b/live": "ok"})
+    assert out["C1"] == ["b/live", "a/low"], f"gap-fill harus yang probe-ok, dapat {out['C1']}"
+    out2 = aa_rank._reorder_all_combos(conn, score_of, groups, {"b/dead": "down", "b/live": "down"})
+    assert out2["C1"] == ["a/low"], f"tanpa probe-ok jangan tambah, dapat {out2['C1']}"
+    conn.close()
+
+
+def test_label_of_fallback_scores_outside_groups():
+    rows = [row("Muse Spark 1.3 (max)", "muse-spark-1-3", 53.0, 40)]
+    by_name, by_slug, by_base = aa_rank.aa_indexes(rows)
+    intel_map = {"Muse Spark 1.3": 53.0}
+    aliases = {"ocr/muse-spark-1.3-contributor-free": "Muse Spark 1.3 (xhigh)"}
+    lab = aa_rank.base_model_name(aliases["ocr/muse-spark-1.3-contributor-free"])
+    assert lab in intel_map and intel_map[lab] == 53.0
+    hit = aa_rank.resolve_aa_row("zzz/muse-spark-1.3-contributor-free", {}, by_name, by_slug, by_base)
+    assert hit is None, "fuzzy ketat: kata asing tidak boleh cocok"
+
+
 def test_effort_distinct_suffix():
     assert aa_rank._route_effort_suffix("ag/gemini-3.8-flash-high") == "high"
     assert aa_rank._route_effort_suffix("ag/gemini-3.8-flash") == ""

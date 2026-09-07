@@ -920,9 +920,9 @@ def _score_combo_models(models, score_of):
     scored.sort(key=lambda x: (-x[1], 0 if model_is_free({"id": x[0]}) else 1, 0 if not _is_review_mid(x[0]) else 1, x[0]))
     return [m for m, _ in scored] + noscore
 
-def _reorder_all_combos(conn, score_of, groups):
+def _reorder_all_combos(conn, score_of, groups, probe_cache=None):
     """Reorder SEMUA combo (tanpa tambah/hapus) + gap-fill 1 model/provider absen per-combo.
-    gap-fill: provider nol di combo -> kandidat skor tertinggi grup itu + probe dikerjakan pemanggil."""
+    gap-fill: provider nol di combo -> kandidat skor tertinggi grup itu, hanya bila probe ok."""
     rows = conn.execute("SELECT name, models FROM combos").fetchall()
     out = {}
     for name, raw in rows:
@@ -935,9 +935,11 @@ def _reorder_all_combos(conn, score_of, groups):
         present = {(str(m).split("/", 1)[0] if "/" in str(m) else str(m)).lower() for m in models}
         adds = []
         for prov in sorted(set(groups) - present):
-            cands = groups.get(prov, [])
-            if cands:
-                adds.append(cands[0]["mid"])
+            for cand in groups.get(prov, []):
+                if probe_cache is not None and probe_cache.get(cand["mid"]) != "ok":
+                    continue
+                adds.append(cand["mid"])
+                break
         out[name] = _score_combo_models(list(models) + adds, score_of)
     return out
 
@@ -1114,6 +1116,14 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
                 st = probe_cache.get(cand["mid"])
                 if st == "ok" and cand["mid"] not in mid_score:
                     mid_score[cand["mid"]] = cand["score"]
+    def label_of(mid):
+        raw = alias.get(mid)
+        if raw:
+            return base_model_name(raw)
+        row = resolve_aa_row(mid, alias, by_name, by_slug, by_base)
+        if row:
+            return base_model_name(row.get("name") or mid)
+        return None
     def score_of(mid):
         if mid in mid_score:
             return mid_score[mid]
@@ -1129,8 +1139,11 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
                     break
         if intel_label and intel_label in intel_map:
             return intel_map[intel_label]
+        lab = label_of(mid)
+        if lab and lab in intel_map:
+            return intel_map[lab]
         return None
-    expected = _reorder_all_combos(conn, score_of, intel_groups)
+    expected = _reorder_all_combos(conn, score_of, intel_groups, probe_cache)
     try:
         cur.execute("BEGIN IMMEDIATE")
         for name, lst in expected.items():

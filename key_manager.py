@@ -947,15 +947,27 @@ class RkmHandler(http.server.BaseHTTPRequestHandler):
                 return
             try:
                 import datetime as _dt
+                import sys as _sys
+                _here = os.path.join(UI_PATH, "aa_rank.py")
+                _spec = None
+                try:
+                    import importlib.util as _ilu
+                    _spec = _ilu.spec_from_file_location("aa_rank_validate", _here)
+                    _arm = _ilu.module_from_spec(_spec)
+                    _spec.loader.exec_module(_arm)
+                    _base = _arm.base_model_name
+                except Exception:
+                    _base = lambda s: (s or "").strip()
                 alias_path = os.path.join(UI_PATH, "aa_alias.json")
                 cache_path = os.path.join(UI_PATH, "aa_cache.json")
                 rows = json.loads(pathlib.Path(cache_path).read_text(encoding="utf-8")).get("data", [])
                 names = {(r.get("name") or "").strip() for r in rows}
+                base_names = {_base(n) for n in names}
                 for mid, label in add.items():
                     if not isinstance(mid, str) or "/" not in mid or not isinstance(label, str) or not label.strip():
                         self._json(400, {"error": f"bad mapping {mid!r}"})
                         return
-                    if label.strip() not in names:
+                    if label.strip() not in names and _base(label.strip()) not in base_names:
                         self._json(400, {"error": f"label unknown di API: {label}"})
                         return
                 alias = json.loads(pathlib.Path(alias_path).read_text(encoding="utf-8")) if os.path.exists(alias_path) else {}

@@ -100,9 +100,9 @@ def test_probe_cache_reused_between_indexes():
 
 def test_alias_override_and_no_fuzzy_match():
     rows = [row("Exact Model", "exact-model", 40, 30)]
-    by_name, by_slug = aa_rank.aa_indexes(rows)
-    assert aa_rank.resolve_aa_row("vendor/odd-name", {"vendor/odd-name": "Exact Model"}, by_name, by_slug)["name"] == "Exact Model"
-    assert aa_rank.resolve_aa_row("vendor/exact-model-v2", {}, by_name, by_slug) is None
+    by_name, by_slug, by_base = aa_rank.aa_indexes(rows)
+    assert aa_rank.resolve_aa_row("vendor/odd-name", {"vendor/odd-name": "Exact Model"}, by_name, by_slug, by_base)["name"] == "Exact Model"
+    assert aa_rank.resolve_aa_row("vendor/exact-model-v2", {}, by_name, by_slug, by_base) is None
 
 
 def test_model_lock_prefilter_requires_all_keys_locked():
@@ -329,6 +329,7 @@ def test_status_snapshot_remap_only_shape():
 
 
 def test_slug_top20_requires_explicit_alias():
+    # DIUBAH 2026-09-07 (base-model): gate alias top-20 DIHAPUS — slug cocok lolos tanpa alias.
     rows = [row("Top Model", "top-model", 99, 90), row("Low Model", "low-model", 10, 9)]
     catalog = [
         {"id": "vendor/top-model", "owned_by": "vendor"},
@@ -336,8 +337,8 @@ def test_slug_top20_requires_explicit_alias():
     ]
     groups, unmatched = aa_rank.build_ranked_candidates(
         catalog, {}, rows, INTEL, AGENTIC, {"vendor"}, {"Top Model"})
-    assert unmatched == 1
-    assert [item["mid"] for item in groups["vendor"]] == ["vendor/low-model"]
+    assert unmatched == 0
+    assert [item["mid"] for item in groups["vendor"]] == ["vendor/top-model", "vendor/low-model"]
 
 
 def test_slug_outside_top20_still_allowed():
@@ -348,12 +349,47 @@ def test_slug_outside_top20_still_allowed():
     ]
     groups, unmatched = aa_rank.build_ranked_candidates(
         catalog, {}, rows, INTEL, AGENTIC, {"vendor"}, {"Top Model", "Other"})
-    assert unmatched == 1
+    assert unmatched == 0
     aliases = {"vendor/top-model": "Top Model"}
     groups2, unmatched2 = aa_rank.build_ranked_candidates(
         catalog, aliases, rows, INTEL, AGENTIC, {"vendor"}, {"Top Model"})
     assert unmatched2 == 0
     assert [item["mid"] for item in groups2["vendor"]] == ["vendor/top-model", "vendor/low-model"]
+
+
+def test_base_model_max_wins_effort_variants():
+    rows = [
+        row("GPT-6 Astra (max)", "gpt-6-astra", 54.7, 40),
+        row("GPT-6 Astra (xhigh)", "gpt-6-astra-xhigh", 54.3, 39),
+        row("GPT-6 Astra (high)", "gpt-6-astra-high", 53.4, 38),
+    ]
+    assert aa_rank.base_model_name("GPT-6 Astra (max)") == "GPT-6 Astra"
+    assert aa_rank.base_model_name("Muse Spark 1.3 (xhigh)") == "Muse Spark 1.3"
+    catalog = [{"id": "cx/gpt-6-astra", "owned_by": "cx"}]
+    groups, unmatched = aa_rank.build_ranked_candidates(catalog, {}, rows, INTEL, AGENTIC, {"cx"}, set())
+    assert unmatched == 0
+    assert groups["cx"][0]["score"] == 54.7
+    assert groups["cx"][0]["label"] == "GPT-6 Astra"
+
+
+def test_non_review_wins_tiebreak():
+    rows = [row("GPT-5.6 Sol (max)", "gpt-5-6-sol", 51.3, 40)]
+    catalog = [
+        {"id": "cx/gpt-5.6-sol", "owned_by": "cx"},
+        {"id": "cx/gpt-5.6-sol-review", "owned_by": "cx"},
+    ]
+    groups, _ = aa_rank.build_ranked_candidates(catalog, {}, rows, INTEL, AGENTIC, {"cx"}, set())
+    assert {c["mid"] for c in groups["cx"]} == {"cx/gpt-5.6-sol", "cx/gpt-5.6-sol-review"}
+    selected = aa_rank.select_working_candidates(groups, lambda _: "ok", workers=1)
+    assert [item["mid"] for item in selected] == ["cx/gpt-5.6-sol"]
+
+
+def test_alias_base_label_resolves():
+    rows = [row("GPT-6 Astra (max)", "gpt-6-astra", 54.7, 40)]
+    by_name, by_slug, by_base = aa_rank.aa_indexes(rows)
+    assert by_base["GPT-6 Astra"]["name"] == "GPT-6 Astra (max)"
+    hit = aa_rank.resolve_aa_row("cx/gpt-6-astra", {"cx/gpt-6-astra": "GPT-6 Astra"}, by_name, by_slug, by_base)
+    assert hit["name"] == "GPT-6 Astra (max)"
 
 
 def test_quorum_blocks_minority_active_prefix():

@@ -183,15 +183,27 @@ def load_alias():
 def normalize_model_id(value):
     return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", (value or "").lower())).strip("-")
 
+def base_model_name(label):
+    """Nama dasar model: strip suffix effort '(...)' — ponytail: effort diset manual di UI 9Router."""
+    base = re.sub(r"\s*\([^)]*\)\s*$", "", (label or "").strip())
+    return base.strip() or (label or "").strip()
+
 def aa_indexes(rows):
     by_name = {}
     by_slug = {}
+    by_base = {}
     ambiguous = set()
     for row in rows or []:
         name = (row.get("name") or "").strip()
         slug = normalize_model_id(row.get("slug") or "")
         if name:
             by_name[name] = row
+            base = base_model_name(name)
+            cur = by_base.get(base)
+            score = (row.get("evaluations") or {}).get("artificial_analysis_intelligence_index")
+            cur_score = (cur.get("evaluations") or {}).get("artificial_analysis_intelligence_index") if cur else None
+            if cur is None or (isinstance(score, (int, float)) and (not isinstance(cur_score, (int, float)) or score > cur_score)):
+                by_base[base] = row
         if slug:
             if slug in by_slug and by_slug[slug].get("id") != row.get("id"):
                 ambiguous.add(slug)
@@ -199,7 +211,7 @@ def aa_indexes(rows):
                 by_slug[slug] = row
     for slug in ambiguous:
         by_slug.pop(slug, None)
-    return by_name, by_slug
+    return by_name, by_slug, by_base
 
 def route_identity_candidates(mid):
     suffix = mid.split("/", 1)[1] if "/" in mid else mid
@@ -212,18 +224,40 @@ def route_identity_candidates(mid):
                 out.append(item)
     return out
 
-def resolve_aa_row(mid, aliases, by_name, by_slug):
+def resolve_aa_row(mid, aliases, by_name, by_slug, by_base=None):
     label = aliases.get(mid)
     if label and label in by_name:
         return by_name[label]
+    if label and by_base is not None and base_model_name(label) in by_base:
+        return by_base[base_model_name(label)]
     for candidate in route_identity_candidates(mid):
         if candidate in by_slug:
             return by_slug[candidate]
+    if by_base is not None:
+        num_re = re.compile(r"^\d+(?:\.\d+)?$")
+        suffix = (mid or "").split("/", 1)[1] if "/" in (mid or "") else (mid or "")
+        toks = set(re.findall(r"[a-z]+|\d+", suffix.lower()))
+        words = {t for t in toks if not num_re.match(t)} - {"review"}
+        best, best_score = None, 0.0
+        for base, row in by_base.items():
+            btoks = set(re.findall(r"[a-z]+|\d+", base.lower()))
+            base_words = {t for t in btoks if not num_re.match(t)}
+            if not base_words or not words.issubset(base_words):
+                continue
+            inter, union = toks & btoks, toks | btoks
+            score = len(inter) / len(union) if union else 0.0
+            if score > best_score:
+                best, best_score = row, score
+        if best is not None and best_score >= 0.5:
+            return best
     return None
+
+def _is_review_mid(mid):
+    return "review" in (mid or "").lower().rsplit("/", 1)[-1]
 
 def build_ranked_candidates(catalog, aliases, rows, target_key, fallback_key, active_prefixes=None,
                             alias_only_labels=None):
-    by_name, by_slug = aa_indexes(rows)
+    by_name, by_slug, by_base = aa_indexes(rows)
     alias_only = set(alias_only_labels or ())
     groups = {}
     unmatched = 0
@@ -234,11 +268,8 @@ def build_ranked_candidates(catalog, aliases, rows, target_key, fallback_key, ac
         provider = mid.split("/", 1)[0].lower()
         if active_prefixes is not None and provider not in active_prefixes:
             continue
-        row = resolve_aa_row(mid, aliases, by_name, by_slug)
+        row = resolve_aa_row(mid, aliases, by_name, by_slug, by_base)
         if not row:
-            unmatched += 1
-            continue
-        if mid not in aliases and (row.get("name") or "") in alias_only:
             unmatched += 1
             continue
         evaluations = row.get("evaluations") or {}
@@ -249,13 +280,13 @@ def build_ranked_candidates(catalog, aliases, rows, target_key, fallback_key, ac
         score = float(primary if isinstance(primary, (int, float)) else fallback)
         candidate = {
             "mid": mid,
-            "label": row.get("name") or mid,
+            "label": base_model_name(row.get("name") or mid),
             "score": score,
             "primary": isinstance(primary, (int, float)),
             "free": model_is_free(model),
         }
-        candidate["sort_key"] = (0 if candidate["primary"] else 1, -score, 0 if candidate["free"] else 1, mid)
-        candidate["order_key"] = (-score, 0 if candidate["free"] else 1, mid)
+        candidate["sort_key"] = (0 if candidate["primary"] else 1, -score, 0 if candidate["free"] else 1, 0 if not _is_review_mid(mid) else 1, mid)
+        candidate["order_key"] = (-score, 0 if candidate["free"] else 1, 0 if not _is_review_mid(mid) else 1, mid)
         groups.setdefault(provider, []).append(candidate)
     for candidates in groups.values():
         candidates.sort(key=lambda item: item["sort_key"])
@@ -330,7 +361,8 @@ def dedup_by_provider(scored):
     def key_fn(x):
         mid, _, score = x
         free = 0 if is_free(mid) else 1
-        return (-score, free, mid)
+        noreview = 0 if not _is_review_mid(mid) else 1
+        return (-score, free, noreview, mid)
     out.sort(key=key_fn)
     return out
 
@@ -546,10 +578,13 @@ def filter_vision_native(conn, scored):
 def build_vision_pool(conn, intel_map, alias):
     scored = []
     for mid in distinct_models(conn):
-        label = alias.get(mid)
-        if not label:
+        raw_label = alias.get(mid)
+        if not raw_label:
             continue
-        score = intel_map.get(label)
+        label = base_model_name(raw_label)
+        score = intel_map.get(raw_label)
+        if not isinstance(score, (int, float)):
+            score = intel_map.get(label)
         if not isinstance(score, (int, float)):
             continue
         scored.append((mid, label, float(score)))
@@ -900,14 +935,14 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
             return 3
         source = "cache-fallback"
         log(f"[aa_rank] AA fetch failed -> cache n={len(rows)} ver={ver}: {error}")
-    by_name, _ = aa_indexes(rows)
+    by_name, _, by_base = aa_indexes(rows)
     intel_map = {}
-    for name, row in by_name.items():
+    for base, row in by_base.items():
         evaluations = row.get("evaluations") or {}
         intel = evaluations.get("artificial_analysis_intelligence_index")
         if isinstance(intel, (int, float)):
-            intel_map[name] = float(intel)
-    log(f"[aa_rank] intel_map {len(intel_map)} source={source}")
+            intel_map[base] = float(intel)
+    log(f"[aa_rank] intel_map {len(intel_map)} base-models source={source}")
     conn, db_path = _open_conn()
     try:
         catalog = fetch_router_catalog(conn)
@@ -922,13 +957,12 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
         conn.close()
         return 4
     catalog, locked_skipped = filter_catalog_by_locks(catalog, inventory)
-    top_labels = {name for name, _ in sorted(intel_map.items(), key=lambda kv: -kv[1])[:COVERAGE_TOPK]}
     intel_groups, intel_unmatched = build_ranked_candidates(
         catalog, alias, rows,
         "artificial_analysis_intelligence_index",
         None,
         active_prefixes,
-        top_labels,
+        set(),
     )
     log(f"[aa_rank] catalog {len(catalog)} active_prefixes {len(active_prefixes)} locked_skip {locked_skipped} candidates Intel {sum(map(len, intel_groups.values()))}/{len(intel_groups)} unmatched {intel_unmatched}")
     api_key = router_key_via_db(conn)
@@ -1129,9 +1163,10 @@ def main():
                 name = r.get("name", "").strip()
                 ev = r.get("evaluations", {})
                 intel = ev.get("artificial_analysis_intelligence_index")
-                if isinstance(intel, (int, float)):
-                    intel_map[name] = float(intel)
-            log(f"[aa_rank] intel_map {len(intel_map)}")
+                base = base_model_name(name)
+                if isinstance(intel, (int, float)) and (base not in intel_map or intel > intel_map[base]):
+                    intel_map[base] = float(intel)
+            log(f"[aa_rank] intel_map {len(intel_map)} base-models")
         except RuntimeError as e:
             low = str(e).lower()
             if "429" in str(e) or "rate" in low:
@@ -1141,18 +1176,19 @@ def main():
                     rows, ver = rows2, ver2
                     intel_map = {}
                     for r in rows:
-                        n = (r.get("name") or "").strip()
+                        n = base_model_name((r.get("name") or "").strip())
                         ev = r.get("evaluations") or {}
                         it = ev.get("artificial_analysis_intelligence_index")
-                        if isinstance(it, (int, float)): intel_map[n] = float(it)
-                    log(f"[aa_rank] fallback intel {len(intel_map)}")
+                        if n and isinstance(it, (int, float)) and (n not in intel_map or it > intel_map[n]):
+                            intel_map[n] = float(it)
+                    log(f"[aa_rank] fallback intel {len(intel_map)} base-models")
                 else:
                     log("[aa_rank] API 429 + no cache -> fallback distinct 50.0")
                     intel_map = {}
                     rows = []
                     ver = "cached"
                     for mid in distinct_models(conn):
-                        label = alias.get(mid)
+                        label = base_model_name(alias.get(mid) or "")
                         if label and label not in intel_map:
                             intel_map[label] = 50.0
                     log(f"[aa_rank] fallback intel_map {len(intel_map)} from distinct")
@@ -1213,11 +1249,12 @@ def main():
         name = r.get("name","").strip()
         ev = r.get("evaluations",{})
         intel = ev.get("artificial_analysis_intelligence_index")
+        base = base_model_name(name)
         if name:
             by_name[name] = r
-            if isinstance(intel, (int,float)):
-                intel_map[name] = float(intel)
-    log(f"[aa_rank] intel_map {len(intel_map)}")
+            if base and isinstance(intel, (int,float)) and (base not in intel_map or intel > intel_map[base]):
+                intel_map[base] = float(intel)
+    log(f"[aa_rank] intel_map {len(intel_map)} base-models")
     conn, db_path = _open_conn()
     distinct = distinct_models(conn)
     log(f"[aa_rank] distinct models {len(distinct)}")
@@ -1226,8 +1263,13 @@ def main():
     def build_scored(score_map, fallback_map=None):
         scored = []
         for mid in distinct:
-            label = alias.get(mid)
+            raw = alias.get(mid)
+            if not raw:
+                continue
+            label = base_model_name(raw)
             score = score_map.get(label) if label and isinstance(score_map.get(label), (int,float)) else None
+            if not isinstance(score, (int,float)):
+                score = score_map.get(raw) if raw and isinstance(score_map.get(raw), (int, float)) else None
             if not isinstance(score, (int,float)):
                 if fallback_map is not None and label and isinstance(fallback_map.get(label), (int,float)):
                     score = float(fallback_map[label])

@@ -92,6 +92,7 @@ def main():
         alias = json.loads(pathlib.Path(ALIAS_PATH).read_text(encoding="utf-8"))
     by_name = {}
     intel = {}
+    by_base = {}
     for r in rows:
         name = (r.get("name") or "").strip()
         if not name:
@@ -100,6 +101,9 @@ def main():
         score = (r.get("evaluations") or {}).get("artificial_analysis_intelligence_index")
         if isinstance(score, (int, float)):
             intel[name] = float(score)
+            base = A.base_model_name(name)
+            if base not in by_base or float(score) > by_base[base][1]:
+                by_base[base] = (name, float(score))
     try:
         conn, _ = A._open_conn()
         catalog = A.fetch_router_catalog(conn)
@@ -108,18 +112,19 @@ def main():
     except Exception as e:
         log(f"[alias_sync] katalog gagal dibaca ({e}) — saran mid dilewati")
         mids = []
-    mapped_labels = set(alias.values())
+    mapped_labels = {A.base_model_name(v) for v in alias.values()}
+    mapped_exact = set(alias.values())
     top = sorted(intel.items(), key=lambda kv: -kv[1])[:TOPK]
     unmapped = []
     for label, score in top:
-        if label in mapped_labels:
+        if A.base_model_name(label) in mapped_labels:
             continue
         best, best_conf = None, 0.0
         for mid in mids:
             conf = fuzzy_mid_label(mid, label)
             if conf > best_conf:
                 best, best_conf = mid, conf
-        unmapped.append({"label": label, "score": score,
+        unmapped.append({"label": A.base_model_name(label), "score": score,
                          "suggest_mid": best if best_conf >= 0.35 else None,
                          "confidence": best_conf if best_conf >= 0.35 else None})
     midset = set(mids)
@@ -127,7 +132,7 @@ def main():
     for mid, label in sorted(alias.items()):
         if mids and mid not in midset:
             stale.append({"mid": mid, "label": label, "reason": "mid-not-in-catalog"})
-        elif label not in by_name:
+        elif label not in mapped_exact and label not in by_name and A.base_model_name(label) not in {A.base_model_name(n) for n in by_name}:
             stale.append({"mid": mid, "label": label, "reason": "label-gone-from-api"})
     by_base = {}
     for name in by_name:

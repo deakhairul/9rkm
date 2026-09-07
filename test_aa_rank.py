@@ -206,6 +206,30 @@ def test_auto_on_all_reactivates():
         _shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_gap_providers_union():
+    groups = {"a": [{"mid": "a/x"}], "b": [{"mid": "b/y"}], "c": [{"mid": "c/z"}]}
+    gap = aa_rank._gap_providers([["a/x"], ["a/x", "b/y"]], groups)
+    assert gap == {"b", "c"}, f"gap per-combo diunion, dapat {gap}"
+    assert aa_rank._gap_providers([["a/x", "b/y", "c/z"]], groups) == set()
+
+
+def test_watchdog_paused_lock_and_grace():
+    import time as _time
+    assert key_manager._watchdog_paused(now=1000.0) is False
+    key_manager._last_remap_end = 900.0
+    try:
+        assert key_manager._watchdog_paused(now=950.0) is True, "grace 60 dtk"
+        assert key_manager._watchdog_paused(now=970.0) is False, "lewat grace jalan lagi"
+    finally:
+        key_manager._last_remap_end = 0.0
+    real = key_manager._remap_lock_state
+    key_manager._remap_lock_state = lambda: True
+    try:
+        assert key_manager._watchdog_paused(now=100000.0) is True, "lock aktif wajib jeda"
+    finally:
+        key_manager._remap_lock_state = real
+
+
 def test_reorder_all_combos_no_delete():
     models = ["b/x", "a/y"]
     score_of = lambda m: {"a/y": 60.0, "b/x": 50.0}.get(m)

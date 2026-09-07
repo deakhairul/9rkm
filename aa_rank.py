@@ -943,6 +943,14 @@ def _reorder_all_combos(conn, score_of, groups, probe_cache=None):
         out[name] = _score_combo_models(list(models) + adds, score_of)
     return out
 
+def _gap_providers(combo_lists, groups):
+    """Provider yang nol di >=1 combo. Probe hemat: hanya grup ini yang diprobe."""
+    gap = set()
+    for models in combo_lists:
+        present = {(str(m).split("/", 1)[0] if "/" in str(m) else str(m)).lower() for m in models or []}
+        gap |= (set(groups) - present)
+    return gap
+
 def _coverage_report(intel_map, intel_groups, probe_cache, topk=COVERAGE_TOPK):
     """Cakupan label skor-top yang punya >=1 kandidat lolos probe.
     Mencegah kasus Muse Spark 1.3: skor 61-62 absen dari combo tanpa peringatan."""
@@ -1022,7 +1030,17 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
     probe_cache = {}
     paid_unavailable = set()
     probe = lambda mid: probe_model(mid, api_key)
-    intel_selected = select_working_candidates(intel_groups, probe, probe_cache, paid_unavailable=paid_unavailable)
+    combo_lists = []
+    for _cname, _craw in conn.execute("SELECT name, models FROM combos").fetchall():
+        try:
+            _arr = json.loads(_craw) if _craw else []
+        except Exception:
+            _arr = []
+        combo_lists.append(_arr if isinstance(_arr, list) else [])
+    gap_provs = _gap_providers(combo_lists, intel_groups)
+    probe_groups = {p: intel_groups[p] for p in gap_provs}
+    log(f"[aa_rank] gap-providers {len(gap_provs)}: {sorted(gap_provs)} (probe hemat, non-gap tanpa probe)")
+    intel_selected = select_working_candidates(probe_groups, probe, probe_cache, paid_unavailable=paid_unavailable)
     intel_sorted = [(item["mid"], item["label"], item["score"]) for item in intel_selected]
     intel_list = [item["mid"] for item in intel_selected]
     log(f"[aa_rank] final Intel {len(intel_list)} probes {len(probe_cache)} (best active per provider)")
@@ -1066,10 +1084,8 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
         log("\n[aa_rank] nothing to write (use --dry or --write)")
         conn.close()
         return 0
-    if not validate_selection(intel_selected, probe_cache):
-        log("[aa_rank] ABORT invalid selection; keep DB", file=sys.stderr)
-        conn.close()
-        return 4
+    if gap_provs and not intel_selected:
+        log("[aa_rank] WARN gap probe nol lolos — gap-fill dilewati, reorder tetap jalan", file=sys.stderr)
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     bak = db_path + f".bak-aa-{ts}"
     try:

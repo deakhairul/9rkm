@@ -506,6 +506,15 @@ def _due_schedule():
 
 WATCHDOG_SEC = 5
 ERROR_FRESH_SEC = 5
+REMAP_GRACE_SEC = 60
+_last_remap_end = 0.0
+
+def _watchdog_paused(now=None):
+    """True bila watchdog wajib jeda: lock remap aktif ATAU grace 60 dtk pasca-remap."""
+    now = now if now is not None else time.time()
+    if _remap_lock_state():
+        return True
+    return (now - _last_remap_end) < REMAP_GRACE_SEC
 
 def _fresh_error_ids(conn, now=None):
     """Key aktif dengan KEJADIAN error 0-5 dtk di requestDetails. Bukan stamp gateway.
@@ -593,7 +602,7 @@ def _auto_on_all():
 def watchdog_thread():
     while True:
         try:
-            if _engine_enabled():
+            if _engine_enabled() and not _watchdog_paused():
                 _watchdog_tick()
         except Exception as e:
             log(f"[-] Watchdog error: {e}")
@@ -717,6 +726,8 @@ def _run_remap(force=False, reason="schedule"):
         _save_cycle_state({"successCycle": _cycle_state().get("successCycle"), "attemptCycle": cycle_id, "at": get_iso_now(), "status": f"error:{error}"})
         return 4
     finally:
+        global _last_remap_end
+        _last_remap_end = time.time()
         try:
             if output:
                 pathlib.Path(REMAP_LOG).write_text(output, encoding="utf-8")

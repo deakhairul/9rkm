@@ -208,7 +208,7 @@ function renderRemap(s){
   if(!t.reorder) txt+='⏸ REORDER OFF — jadwal+versi+remap pause. ';
   if(!t.autoOff) txt+='⏸ AUTO-OFF OFF — watchdog + auto-ON pause. ';
   if(r.cooldownSec>0) txt+=`cooldown ${Math.ceil(r.cooldownSec/60)}m `;
-  if(r.lastWib) txt+=`last ${r.lastWib} src=${r.source||'-'} Intel ${r.intel??'-'} Vision ${r.vision??'-'} | cache ${r.cacheAgeH!=null?r.cacheAgeH+'j':'-'} `+(r.coverage?`Cov ${r.coverage.pct}%${r.coverage.warn?' ⚠':''} `:'');
+  if(r.lastWib) txt+=`last ${r.lastWib} src=${r.source||'-'} Intel ${r.intel??'-'} Vision ${r.vision??'-'} Audio ${r.audio??'-'} | cache ${r.cacheAgeH!=null?r.cacheAgeH+'j':'-'} `+(r.coverage?`Cov ${r.coverage.pct}%${r.coverage.warn?' ⚠':''} `:'');
   else if(r.cacheAt) txt+=`cache ${r.cacheAgeH}j `;
   el.textContent=txt;
   const btn=document.getElementById('bRemap');

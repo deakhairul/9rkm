@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-aa_rank.py — sync 1 combo AA (Intelligence) + Vision dari Data API v2/free
-Scope: Artificial-Analysis-Intelligence-Index + Vision-Adapter
+aa_rank.py — sync combo AA (Intelligence) + Vision + Audio dari Data API v2/free
+Scope: Builder/Planner (semua combos via reorder) + Vision-Adapter + AudioInput-Adapter
 Source: https://artificialanalysis.ai/api/v2/language/models/free (x-api-key)
 Aturan: discover katalog 9Router, rank semua kandidat per provider, probe terbaik turun sampai 2xx, satu model/provider
 Jadwal: setiap siklus 5 jam fetch skor AA + katalog provider; cache AA hanya fallback saat fetch gagal
@@ -634,6 +634,146 @@ def write_vision_adapter(conn, pool):
         log(f"  {score:6.1f} [{tag:4}] {mid:45} <- {label}")
     return True
 
+def _audio_wav_b64():
+    """WAV 0.1s silence 8kHz 16-bit mono — cukup untuk probe input_audio."""
+    import base64 as _b64
+    import struct as _st
+    samples = _st.pack('<800h', *([0] * 800))
+    wav = (b'RIFF' + _st.pack('<I', 36 + 1600) + b'WAVEfmt '
+           + _st.pack('<IHHIIHH', 16, 1, 1, 8000, 16000, 2, 16)
+           + b'data' + _st.pack('<I', 1600) + samples)
+    return _b64.b64encode(wav).decode()
+
+def probe_audio_native(mid, api_key, timeout=PROBE_TIMEOUT):
+    """Probe audio native via input_audio (spike 2026-09-08: OK di gemini).
+    ok = 2xx + content; no_audio = model eksplisit tak dukung audio;
+    rate/down/fail mengikuti pola probe_vision_native (ADR 0003: 400 = down)."""
+    if not api_key:
+        return "fail"
+    try:
+        b64 = _audio_wav_b64()
+    except Exception:
+        return "fail"
+    content = [{"type": "text", "text": "transcribe this audio in one word"},
+               {"type": "input_audio", "input_audio": {"data": b64, "format": "wav"}}]
+    for max_tok in (16, 32):
+        payload = json.dumps({"model": mid, "messages": [{"role": "user", "content": content}],
+                              "max_tokens": max_tok, "stream": False})
+        try:
+            req = urllib.request.Request(ROUTER_API, data=payload.encode(),
+                                         headers={"Authorization": f"Bearer {api_key}",
+                                                  "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                d = json.loads(r.read().decode())
+                msg = d.get("choices", [{}])[0].get("message", {})
+                content_out = msg.get("content")
+                if content_out is not None and str(content_out).strip():
+                    return "ok"
+                if msg:
+                    return "ok"
+                return "down"
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8", "replace")
+            except Exception:
+                body = str(e)
+            low = body.lower()
+            if "does not support" in low and "audio" in low:
+                return "no_audio"
+            if "unsupported" in low and "audio" in low:
+                return "no_audio"
+            if "429" in str(e) or "rate_limit" in low or "freeusagelimit" in low:
+                return "rate"
+            if "no active credentials" in low or "model_not_found" in low:
+                return "down"
+            if "bad_request" in low:
+                return "down"
+            if max_tok == 32:
+                return "fail"
+            time.sleep(PROBE_RETRY_SLEEP)
+            continue
+        except Exception:
+            if max_tok == 32:
+                return "fail"
+            time.sleep(PROBE_RETRY_SLEEP)
+    return "fail"
+
+def filter_audio_native(conn, scored):
+    """Probe audio native TANPA mutasi settings — pola sama filter_vision_native."""
+    if not scored:
+        return scored
+    api_key = router_key_via_db(conn)
+    if not api_key:
+        log("[aa_rank] WARN no router apiKey, skip audio probe")
+        return scored
+    def do_probe(item):
+        mid, _, _ = item
+        st = probe_audio_native(mid, api_key)
+        return (item, st)
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(PROBE_WORKERS, 4)) as ex:
+        futs = {ex.submit(do_probe, it): it for it in scored}
+        for f in concurrent.futures.as_completed(futs):
+            item, st = f.result()
+            results[item[0]] = st
+            log(f"[aa_rank] audio probe {st:10} {item[0]}")
+    kept = []
+    for mid, label, score in scored:
+        st = results.get(mid, "fail")
+        if st == "ok":
+            kept.append((mid, label, score))
+        else:
+            log(f"[aa_rank] audio EXCLUDE {mid} probe={st}")
+    return kept
+
+def build_audio_pool(conn, intel_map, alias):
+    """Pool audioInput: skor Intel sebagai proxy (AA tak punya indeks audio),
+    probe input_audio native, free-first, 1/provider — sejajar build_vision_pool."""
+    scored = []
+    for mid in distinct_models(conn):
+        raw_label = alias.get(mid)
+        if not raw_label:
+            continue
+        label = base_model_name(raw_label)
+        score = intel_map.get(raw_label)
+        if not isinstance(score, (int, float)):
+            score = intel_map.get(label)
+        if not isinstance(score, (int, float)):
+            continue
+        scored.append((mid, label, float(score)))
+    if not scored:
+        return []
+    scored.sort(key=lambda x: (-x[2], 0 if is_free(x[0]) else 1, x[0]))
+    probed = filter_audio_native(conn, scored)
+    free_ok = [x for x in probed if is_free(x[0])]
+    paid_ok = [x for x in probed if not is_free(x[0])]
+    free_dedup = dedup_by_provider(free_ok)
+    paid_dedup = dedup_by_provider(paid_ok)
+    seen = {m.split("/")[0].lower() for m, _, _ in free_dedup}
+    paid_filtered = [x for x in paid_dedup if x[0].split("/")[0].lower() not in seen]
+    pool = free_dedup + paid_filtered
+    log(f"[aa_rank] audio pool free {len(free_dedup)} paid {len(paid_filtered)} total {len(pool)} (free-first, native probe, 1/provider)")
+    return pool
+
+def write_audio_adapter(conn, pool):
+    """Tulis settings.data.capacityAdapter.audioInput (kunci live 2026-09-08).
+    Jangan sentuh vision/pdf/videoInput — update subkey saja."""
+    cur_data_row = conn.execute("SELECT data FROM settings WHERE id=1").fetchone()
+    if not cur_data_row:
+        log("[aa_rank] no settings row", file=sys.stderr)
+        return False
+    data = json.loads(cur_data_row[0])
+    if "capacityAdapter" not in data:
+        data["capacityAdapter"] = {}
+    pool_ids = [mid for mid, _, _ in pool]
+    data["capacityAdapter"]["audioInput"] = {"enabled": True, "roundRobin": True, "models": pool_ids}
+    conn.execute("UPDATE settings SET data=? WHERE id=1", (json.dumps(data),))
+    log(f"[aa_rank] wrote capacityAdapter.audioInput {len(pool_ids)} models")
+    for mid, label, score in pool:
+        tag = "free" if is_free(mid) else "paid"
+        log(f"  {score:6.1f} [{tag:4}] {mid:45} <- {label}")
+    return True
+
 def router_key_via_db(conn):
     try:
         cur = conn.cursor()
@@ -973,9 +1113,9 @@ def _coverage_report(intel_map, intel_groups, probe_cache, topk=COVERAGE_TOPK):
             "warn": pct < COVERAGE_MIN_PCT, "missing": missing[:10]}
 
 
-def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
+def _do_remap_unlocked(write=True, with_vision=True, with_audio=True, dry=False, use_cache=True):
     alias = load_alias()
-    log(f"[aa_rank] REMAP alias {len(alias)} cache_fallback={use_cache} write={write} with_vision={with_vision} dry={dry}")
+    log(f"[aa_rank] REMAP alias {len(alias)} cache_fallback={use_cache} write={write} with_vision={with_vision} with_audio={with_audio} dry={dry}")
     try:
         rows, ver, tier, rem = fetch_api_all()
         source = "api"
@@ -992,7 +1132,7 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
             return 3
         source = "cache-fallback"
         log(f"[aa_rank] AA fetch failed -> cache n={len(rows)} ver={ver}: {error}")
-    by_name, _, by_base = aa_indexes(rows)
+    by_name, by_slug, by_base = aa_indexes(rows)
     intel_map = {}
     for base, row in by_base.items():
         evaluations = row.get("evaluations") or {}
@@ -1071,11 +1211,22 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
             vision_pool = build_vision_pool(conn, intel_map, alias)
         except Exception as e:
             log(f"[aa_rank] vision pool fail {e}")
+    audio_pool = None
+    if with_audio:
+        try:
+            audio_pool = build_audio_pool(conn, intel_map, alias)
+        except Exception as e:
+            log(f"[aa_rank] audio pool fail {e}")
     if dry and not write:
         log("\n[aa_rank] --dry done (no DB write)")
         if vision_pool:
             log(f"[aa_rank] vision pool preview {len(vision_pool)}")
             for mid, label, score in vision_pool:
+                tag = "free" if is_free(mid) else "paid"
+                log(f"  {score:6.1f} [{tag:4}] {mid:45} <- {label}")
+        if audio_pool:
+            log(f"[aa_rank] audio pool preview {len(audio_pool)}")
+            for mid, label, score in audio_pool:
                 tag = "free" if is_free(mid) else "paid"
                 log(f"  {score:6.1f} [{tag:4}] {mid:45} <- {label}")
         conn.close()
@@ -1108,11 +1259,13 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
         return 2
     cur = conn.cursor()
     prev_vision = None
+    prev_audio = None
     try:
         row = conn.execute("SELECT data FROM settings WHERE id=1").fetchone()
         if row and row[0]:
             d = json.loads(row[0])
             prev_vision = d.get("capacityAdapter", {}).get("vision", {}).get("models")
+            prev_audio = d.get("capacityAdapter", {}).get("audioInput", {}).get("models")
     except Exception:
         pass
     rollback_path = db_path + f".combo-rollback-{ts}.json"
@@ -1171,7 +1324,11 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
             write_vision_adapter(conn, vision_pool)
         else:
             log("[aa_rank] vision unchanged")
-        remap_state = {"at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00","Z"), "source": source, "intel": len(intel_list), "coverage": coverage, "vision": len(vision_pool) if vision_pool else 0, "ver": ver, "backup": bak, "rollback": rollback_path, "combos": {n: len(v) for n, v in expected.items()}}
+        if audio_pool:
+            write_audio_adapter(conn, audio_pool)
+        else:
+            log("[aa_rank] audio unchanged")
+        remap_state = {"at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00","Z"), "source": source, "intel": len(intel_list), "coverage": coverage, "vision": len(vision_pool) if vision_pool else 0, "audio": len(audio_pool) if audio_pool else 0, "ver": ver, "backup": bak, "rollback": rollback_path, "combos": {n: len(v) for n, v in expected.items()}}
         cur.execute("INSERT INTO kv(scope,key,value) VALUES(?,?,?) ON CONFLICT(scope,key) DO UPDATE SET value=excluded.value", (KV_REMAP_SCOPE, KV_REMAP_KEY, json.dumps(remap_state)))
         for name, lst in expected.items():
             row = cur.execute("SELECT models FROM combos WHERE name=?", (name,)).fetchone()
@@ -1191,11 +1348,18 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
         if row:
             d = json.loads(row[0])
             log(f"[aa_rank] verify vision {d.get('capacityAdapter',{}).get('vision',{})}")
+    if audio_pool is not None:
+        row = conn.execute("SELECT data FROM settings WHERE id=1").fetchone()
+        if row:
+            d = json.loads(row[0])
+            log(f"[aa_rank] verify audioInput {d.get('capacityAdapter',{}).get('audioInput',{})}")
     try:
         import tg_notify
         msg = f"<b>AA Rank</b> {source} sync {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} — Intel {len(intel_list)} ver={ver} src={source}"
         if vision_pool is not None:
             msg += f" Vision {len(vision_pool)}"
+        if audio_pool is not None:
+            msg += f" Audio {len(audio_pool)}"
         tg_notify.notify(msg)
     except Exception:
         pass
@@ -1204,9 +1368,9 @@ def _do_remap_unlocked(write=True, with_vision=True, dry=False, use_cache=True):
     log(f"[aa_rank] done source={source}")
     return 0
 
-def do_remap(write=True, with_vision=True, dry=False, use_cache=True):
+def do_remap(write=True, with_vision=True, with_audio=True, dry=False, use_cache=True):
     if os.environ.get("AA_REMAP_LOCK_HELD") == "1":
-        return _do_remap_unlocked(write, with_vision, dry, use_cache)
+        return _do_remap_unlocked(write, with_vision, with_audio, dry, use_cache)
     lock_path = "/tmp/9rkm-remap.lock"
     try:
         import fcntl
@@ -1221,7 +1385,7 @@ def do_remap(write=True, with_vision=True, dry=False, use_cache=True):
         os.close(descriptor)
         return 5
     try:
-        return _do_remap_unlocked(write, with_vision, dry, use_cache)
+        return _do_remap_unlocked(write, with_vision, with_audio, dry, use_cache)
     finally:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
@@ -1236,24 +1400,26 @@ def main():
         use_cache = "--no-cache" not in sys.argv
         dry = "--dry" in sys.argv
         write = "--write" in sys.argv or "--cron" in sys.argv or not dry
-        with_vision = "--vision" in sys.argv
-        if "--no-vision" in sys.argv:
-            with_vision = False
+        # Default --remap mencakup vision+audio (siklus 5 jam); opt-out via --no-vision/--no-audio.
+        with_vision = "--no-vision" not in sys.argv
+        with_audio = "--no-audio" not in sys.argv
         if "--cron" in sys.argv:
             dry = False
             write = True
             use_cache = True
-        sys.exit(do_remap(write=write, with_vision=with_vision, dry=dry, use_cache=use_cache))
+        sys.exit(do_remap(write=write, with_vision=with_vision, with_audio=with_audio, dry=dry, use_cache=use_cache))
     dry = "--dry" in sys.argv
     write = "--write" in sys.argv
     cron = "--cron" in sys.argv
     vision_only = "--vision" in sys.argv and "--with-vision" not in sys.argv and "--remap" not in sys.argv
     vision_with_combos = "--with-vision" in sys.argv
+    audio_only = "--audio" in sys.argv and "--with-audio" not in sys.argv and "--remap" not in sys.argv
+    audio_with_combos = "--with-audio" in sys.argv
     if cron:
         log("[aa_rank] --cron deprecated -> full discovery remap")
-        sys.exit(do_remap(write=True, with_vision=vision_with_combos, dry=False, use_cache=True))
+        sys.exit(do_remap(write=True, with_vision=vision_with_combos, with_audio=audio_with_combos, dry=False, use_cache=True))
     alias = load_alias()
-    log(f"[aa_rank] alias {len(alias)} entries vision_only={vision_only} with_vision={vision_with_combos} (legacy path: add --fetch/--remap for cache mode)")
+    log(f"[aa_rank] alias {len(alias)} entries vision_only={vision_only} with_vision={vision_with_combos} audio_only={audio_only} with_audio={audio_with_combos} (legacy path: add --fetch/--remap for cache mode)")
     if vision_only:
         conn, _ = _open_conn()
         try:
@@ -1329,6 +1495,77 @@ def main():
         conn.close()
         log("[aa_rank] vision done")
         return
+    if audio_only:
+        conn, _ = _open_conn()
+        try:
+            rows, ver, _, _ = fetch_api_all()
+            log(f"[aa_rank] API total {len(rows)} ver={ver}")
+            intel_map = {}
+            for r in rows:
+                name = r.get("name", "").strip()
+                ev = r.get("evaluations", {})
+                intel = ev.get("artificial_analysis_intelligence_index")
+                base = base_model_name(name)
+                if isinstance(intel, (int, float)) and (base not in intel_map or intel > intel_map[base]):
+                    intel_map[base] = float(intel)
+            log(f"[aa_rank] intel_map {len(intel_map)} base-models")
+        except RuntimeError as e:
+            low = str(e).lower()
+            if "429" in str(e) or "rate" in low:
+                log("[aa_rank] API 429 -> fallback cache")
+                rows2, ver2 = load_cache()
+                if rows2:
+                    rows, ver = rows2, ver2
+                    intel_map = {}
+                    for r in rows:
+                        n = base_model_name((r.get("name") or "").strip())
+                        ev = r.get("evaluations") or {}
+                        it = ev.get("artificial_analysis_intelligence_index")
+                        if n and isinstance(it, (int, float)) and (n not in intel_map or it > intel_map[n]):
+                            intel_map[n] = float(it)
+                    log(f"[aa_rank] fallback intel {len(intel_map)} base-models")
+                else:
+                    raise
+            else:
+                raise
+        audio_pool = build_audio_pool(conn, intel_map, alias)
+        if dry and not write:
+            log("\n[aa_rank] --dry --audio done (no DB write)")
+            if audio_pool:
+                log(f"[aa_rank] audio pool preview {len(audio_pool)}")
+                for mid, label, score in audio_pool:
+                    tag = "free" if is_free(mid) else "paid"
+                    log(f"  {score:6.1f} [{tag:4}] {mid:45} <- {label}")
+            conn.close()
+            return
+        if not write:
+            log("\n[aa_rank] nothing to write (use --dry or --write)")
+            conn.close()
+            return
+        import shutil as _sh, hashlib as _hl
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        _, db_path = _open_conn()
+        bak = db_path + f".bak-aa-audio-{ts}"
+        try:
+            _sh.copy2(db_path, bak)
+            md5 = _hl.md5(open(bak, "rb").read()).hexdigest()[:8]
+            log(f"[aa_rank] backup {bak} md5 {md5}")
+        except Exception as e:
+            log(f"[aa_rank] backup fail {e}", file=sys.stderr)
+            sys.exit(2)
+        if not audio_pool:
+            log("[aa_rank] GUARD skip write audio empty -> keep DB")
+            conn.close()
+            return
+        ok = write_audio_adapter(conn, audio_pool)
+        conn.commit()
+        row = conn.execute("SELECT data FROM settings WHERE id=1").fetchone()
+        if row:
+            d = json.loads(row[0])
+            log(f"[aa_rank] verify audioInput {d.get('capacityAdapter',{}).get('audioInput',{})}")
+        conn.close()
+        log("[aa_rank] audio done")
+        return
     # legacy combo path (tanpa cache flag) -> tetap support tapi fallback cache jika 429
     try:
         rows, ver, _, _ = fetch_api_all()
@@ -1396,11 +1633,22 @@ def main():
             vision_pool = build_vision_pool(conn, intel_map, alias)
         except Exception as e:
             log(f"[aa_rank] vision pool fail {e}")
+    audio_pool = None
+    if audio_with_combos:
+        try:
+            audio_pool = build_audio_pool(conn, intel_map, alias)
+        except Exception as e:
+            log(f"[aa_rank] audio pool fail {e}")
     if dry and not write:
         log("\n[aa_rank] --dry done (no DB write)")
         if vision_pool:
             log(f"[aa_rank] vision pool preview {len(vision_pool)}")
             for mid, label, score in vision_pool:
+                tag = "free" if is_free(mid) else "paid"
+                log(f"  {score:6.1f} [{tag:4}] {mid:45} <- {label}")
+        if audio_pool:
+            log(f"[aa_rank] audio pool preview {len(audio_pool)}")
+            for mid, label, score in audio_pool:
                 tag = "free" if is_free(mid) else "paid"
                 log(f"  {score:6.1f} [{tag:4}] {mid:45} <- {label}")
         return
@@ -1421,6 +1669,7 @@ def main():
     # GUARD: jangan tulis combo kosong — pakai DB lama (fallback database)
     prev_intel = None
     prev_vision = None
+    prev_audio = None
     try:
         cur.execute("SELECT models FROM combos WHERE name=?", (COMBO_INTEL,))
         r = cur.fetchone()
@@ -1433,6 +1682,7 @@ def main():
         if row and row[0]:
             d = json.loads(row[0])
             prev_vision = d.get("capacityAdapter", {}).get("vision", {}).get("models")
+            prev_audio = d.get("capacityAdapter", {}).get("audioInput", {}).get("models")
     except Exception:
         pass
     if not intel_list:
@@ -1458,6 +1708,13 @@ def main():
             write_vision_adapter(conn, vision_pool)
     else:
         log(f"[aa_rank] vision_pool None -> skip")
+    if audio_pool is not None:
+        if len(audio_pool) == 0:
+            log(f"[aa_rank] GUARD skip write audio empty -> keep DB {len(prev_audio) if prev_audio else 0}")
+        else:
+            write_audio_adapter(conn, audio_pool)
+    else:
+        log(f"[aa_rank] audio_pool None -> skip")
     conn.commit()
     cur.execute("SELECT name, json_array_length(models) FROM combos WHERE name = ?", (COMBO_INTEL,))
     for row in cur.fetchall():
@@ -1467,11 +1724,18 @@ def main():
         if row:
             d = json.loads(row[0])
             log(f"[aa_rank] verify vision {d.get('capacityAdapter',{}).get('vision',{})}")
+    if audio_pool is not None:
+        row = conn.execute("SELECT data FROM settings WHERE id=1").fetchone()
+        if row:
+            d = json.loads(row[0])
+            log(f"[aa_rank] verify audioInput {d.get('capacityAdapter',{}).get('audioInput',{})}")
     try:
         import tg_notify
         msg = f"<b>AA Rank</b> API v2/free sync {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} — Intel {len(intel_list)} pureAA 1/provider ver={ver}"
         if vision_pool is not None:
             msg += f" Vision {len(vision_pool)}"
+        if audio_pool is not None:
+            msg += f" Audio {len(audio_pool)}"
         tg_notify.notify(msg)
     except Exception:
         pass

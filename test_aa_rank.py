@@ -630,10 +630,11 @@ def test_rollback_marks_visible_state_truthful():
     km, db, tmp = _lifecycle_env()
     try:
         conn = _sqlite3.connect(db)
-        conn.execute("INSERT INTO combos VALUES('Artificial-Analysis-Intelligence-Index', ?)",
-                     (_json.dumps(["a/x", "b/y"]),))
+        for name in km.COMBO_NAMES:
+            conn.execute("INSERT INTO combos VALUES(?, ?)",
+                         (name, _json.dumps(["a/x", "b/y"])))
         conn.execute("INSERT INTO kv VALUES('aa_remap', 'state', ?)",
-                     (_json.dumps({"at": "lama", "source": "api", "intel": 99, "coverage": {}, "vision": 5, "ver": "4.1"}),))
+                     (_json.dumps({"at": "lama", "source": "api", "intel": 99, "coverage": {}, "vision": 5, "audio": 6, "ver": "4.1"}),))
         conn.commit()
         conn.close()
         km._mark_remap_rolled_back("uji-gagal")
@@ -644,6 +645,7 @@ def test_rollback_marks_visible_state_truthful():
         assert st["source"].startswith("rollback:")
         assert st["intel"] == 2
         assert st["vision"] == 5
+        assert st["audio"] == 6
         assert st["ver"] == "4.1", "rollback harus pertahankan versi"
         assert st["rollback"] is True
     finally:
@@ -710,6 +712,52 @@ def test_auto_on_cycle_once_per_cycle():
         assert n1 == 2, f"auto-ON pertama harus 2, dapat {n1}"
         n2 = km._maybe_auto_on_cycle()
         assert n2 == 0, f"panggil kedua siklus sama harus 0, dapat {n2}"
+    finally:
+        _os.environ.pop("ROUTER_DB", None)
+        import shutil as _shutil
+        _shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_audio_adapter_key_is_audioInput():
+    import inspect as _insp
+    src = _insp.getsource(aa_rank.write_audio_adapter)
+    assert "audioInput" in src, "writer audio wajib pakai kunci live audioInput"
+    assert '"audio"' not in src.replace('"audioInput"', '').replace("'audioInput'", ''), \
+        "jangan tulis kunci audio generik"
+    sig = _insp.signature(aa_rank._do_remap_unlocked)
+    assert "with_audio" in sig.parameters, "remap wajib terima with_audio"
+    assert hasattr(aa_rank, "probe_audio_native")
+    assert hasattr(aa_rank, "build_audio_pool")
+
+
+def test_audio_write_preserves_vision():
+    conn = _sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE settings(id INTEGER PRIMARY KEY, data TEXT)")
+    conn.execute("INSERT INTO settings VALUES(1, ?)",
+                 (_json.dumps({"capacityAdapter": {"vision": {"enabled": True, "roundRobin": True,
+                                                              "models": ["v/x"]}}}),))
+    assert aa_rank.write_audio_adapter(conn, [("a/m", "M", 50.0)]) is True
+    d = _json.loads(conn.execute("SELECT data FROM settings WHERE id=1").fetchone()[0])
+    assert d["capacityAdapter"]["audioInput"]["models"] == ["a/m"]
+    assert d["capacityAdapter"]["vision"]["models"] == ["v/x"], "tulis audio jangan hapus vision"
+    conn.close()
+
+
+def test_combo_names_are_live_and_version_merged_in_cycle():
+    import inspect as _insp
+    km, db, tmp = _lifecycle_env()
+    try:
+        assert tuple(km.COMBO_NAMES) == ("Builder", "Planner"), \
+            f"COMBO_NAMES harus live Builder/Planner, dapat {km.COMBO_NAMES}"
+        ssrc = _insp.getsource(km.remap_scheduler_thread)
+        assert "VERSION_CHECK_SEC" not in ssrc and "_check_version_changed" not in ssrc, \
+            "version-watch per-jam harus lebur ke siklus 5 jam"
+        assert "_due_schedule()" in ssrc
+        rsrc = _insp.getsource(km._run_remap)
+        assert "--with-vision" in rsrc and "--with-audio" in rsrc, \
+            "remap wajib sertakan vision+audio"
+        assert "_restore_settings" in rsrc, "rollback wajib kembalikan settings"
+        assert "_probe_vision" in rsrc and "_probe_audio" in rsrc
     finally:
         _os.environ.pop("ROUTER_DB", None)
         import shutil as _shutil

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 9RKM - 9Router Key Manager, edisi remap-only (2026-09-05, amendemen PRD remap-only).
-Satu daemon remap combo model terbaik tiap siklus 5 jam + auto-remap saat versi
-AA Intelligence Index berubah + watchdog auto-OFF key error fresh:
-  - Thread scheduler: remap terjadwal 5 jam + cek versi ringan 1x/jam (gate: reorder)
+Satu daemon remap combo+vision+audio tiap siklus 5 jam + watchdog auto-OFF key error fresh:
+  - Thread scheduler: remap terjadwal 5 jam (combo Builder/Planner + capacityAdapter
+    vision + audioInput; versi AA dibaca dari hasil fetch remap itu sendiri — tanpa
+    cek versi ringan per-jam lagi) (gate: reorder)
   - Thread watchdog : OFF key error fresh<=5s + auto-ON tiap siklus 5 jam (gate: auto_off)
   - Thread HTTP     : Web UI status + REMAP manual + approve alias, Tailscale-only
 Split toggle 2026-09-08 (PRD split-toggle): Auto Off Key dan Reorder Combo independen.
@@ -44,7 +45,8 @@ ENGINE_AUTO_OFF_SCOPE = "rkm_engine_auto_off"
 ENGINE_REORDER_SCOPE = "rkm_engine_reorder"
 AA_API_BASE = "https://artificialanalysis.ai/api/v2/language/models/free"
 AA_KEY_ENV = "AA_API_KEY"
-COMBO_NAMES = ("Artificial-Analysis-Intelligence-Index",)
+# Nama combo live di DB (dulu Artificial-Analysis-Intelligence-Index, kini Builder/Planner).
+COMBO_NAMES = ("Builder", "Planner")
 EC_HINT = {400: "Request salah", 401: "Kunci salah/expired", 402: "Saldo habis", 403: "Akses ditolak", 429: "Kuota habis"}
 
 def _hint(ec):
@@ -153,7 +155,7 @@ def _release_remap_lock(descriptor):
     os.close(descriptor)
 
 def _remap_snapshot(cursor):
-    out = {"lastAt": None, "lastWib": None, "source": None, "intel": None, "coverage": None, "vision": None, "ver": None, "cacheAt": None, "cacheAgeH": None, "locked": False, "cooldownSec": 0}
+    out = {"lastAt": None, "lastWib": None, "source": None, "intel": None, "coverage": None, "vision": None, "audio": None, "ver": None, "cacheAt": None, "cacheAgeH": None, "locked": False, "cooldownSec": 0}
     try:
         cursor.execute("SELECT value FROM kv WHERE scope=? AND key=?", ("aa_cache", "state"))
         r = cursor.fetchone()
@@ -179,6 +181,7 @@ def _remap_snapshot(cursor):
             out["source"] = j.get("source")
             out["intel"] = j.get("intel")
             out["vision"] = j.get("vision")
+            out["audio"] = j.get("audio")
             out["ver"] = j.get("ver")
             out["coverage"] = j.get("coverage")
             if j.get("at"):
@@ -224,6 +227,107 @@ def _restore_combos(snapshot):
         raise
     finally:
         conn.close()
+
+def _settings_snapshot():
+    """Raw settings.data (menutup capacityAdapter vision+audioInput) untuk rollback."""
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT data FROM settings WHERE id=1").fetchone()
+        return row[0] if row and row[0] else None
+    finally:
+        conn.close()
+
+def _restore_settings(raw):
+    if raw is None:
+        return
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute("UPDATE settings SET data=? WHERE id=1", (raw,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def _adapter_first_model(kind):
+    """Model pertama pool adapter: vision -> capacityAdapter.vision.models[0],
+    audio -> capacityAdapter.audioInput.models[0]. None = pool kosong (skip E2E)."""
+    key = "vision" if kind == "vision" else "audioInput"
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT data FROM settings WHERE id=1").fetchone()
+        if not row or not row[0]:
+            return None
+        try:
+            d = json.loads(row[0])
+        except Exception:
+            return None
+        models = (d.get("capacityAdapter") or {}).get(key, {}).get("models") or []
+        return models[0] if models else None
+    finally:
+        conn.close()
+
+def _probe_vision(timeout=90):
+    """E2E vision non-blokir: PNG 1x1 ke model pertama pool. True = lolos/skip."""
+    mid = _adapter_first_model("vision")
+    if not mid:
+        return True
+    api_key = _router_api_key()
+    if not api_key:
+        return False
+    png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"
+    payload = json.dumps({"model": mid, "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "describe this 1x1 image one word"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + png}}]}],
+        "max_tokens": 32, "stream": False}).encode()
+    req = urllib.request.Request("http://127.0.0.1:20128/v1/chat/completions", data=payload,
+                                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            if not (200 <= r.status < 300):
+                return False
+            d = json.loads(r.read().decode("utf-8", "replace"))
+            msg = (d.get("choices") or [{}])[0].get("message", {}) if isinstance(d, dict) else {}
+            return bool(msg)
+    except Exception:
+        return False
+
+def _probe_audio(timeout=90):
+    """E2E audio non-blokir: WAV sunyi 0.1s via input_audio ke model pertama pool."""
+    mid = _adapter_first_model("audio")
+    if not mid:
+        return True
+    api_key = _router_api_key()
+    if not api_key:
+        return False
+    try:
+        import base64 as _b64
+        import struct as _st
+        samples = _st.pack('<800h', *([0] * 800))
+        wav = (b'RIFF' + _st.pack('<I', 36 + 1600) + b'WAVEfmt '
+               + _st.pack('<IHHIIHH', 16, 1, 1, 8000, 16000, 2, 16)
+               + b'data' + _st.pack('<I', 1600) + samples)
+        b64 = _b64.b64encode(wav).decode()
+    except Exception:
+        return False
+    payload = json.dumps({"model": mid, "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "transcribe this audio in one word"},
+        {"type": "input_audio", "input_audio": {"data": b64, "format": "wav"}}]}],
+        "max_tokens": 32, "stream": False}).encode()
+    req = urllib.request.Request("http://127.0.0.1:20128/v1/chat/completions", data=payload,
+                                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            if not (200 <= r.status < 300):
+                return False
+            d = json.loads(r.read().decode("utf-8", "replace"))
+            msg = (d.get("choices") or [{}])[0].get("message", {}) if isinstance(d, dict) else {}
+            return bool(msg)
+    except Exception:
+        return False
 
 def _router_api_key():
     conn = get_db()
@@ -337,7 +441,7 @@ def _mark_remap_rolled_back(reason):
                     pass
         state = {"at": get_iso_now(), "source": "rollback:" + str(reason)[:60],
                  "intel": n, "coverage": {"topk": 0, "covered": 0, "pct": 0.0, "warn": True, "missing": []},
-                 "vision": prev.get("vision"), "ver": prev.get("ver"),
+                 "vision": prev.get("vision"), "audio": prev.get("audio"), "ver": prev.get("ver"),
                  "backup": prev.get("backup"), "rollback": True}
         cur.execute("INSERT INTO kv(scope,key,value) VALUES(?,?,?) ON CONFLICT(scope,key) DO UPDATE SET value=excluded.value",
                     ("aa_remap", "state", json.dumps(state)))
@@ -542,7 +646,8 @@ def _set_engine_enabled(enabled):
         conn.close()
 
 def _fetch_aa_version(timeout=25):
-    """Cek ringan: page=1 saja, baca intelligence_index_version. Hemat kuota."""
+    """DEPRECATED 2026-09-08: versi dibaca dari fetch remap per-siklus 5 jam.
+    Disimpan untuk kompat manual; scheduler tidak lagi memanggil per-jam."""
     key = _aa_api_key()
     if not key:
         raise RuntimeError("AA API key missing")
@@ -569,7 +674,8 @@ def _remap_ver():
     return None
 
 def _check_version_changed():
-    """True bila versi live != versi remap terakhir. Selalu catat hasil cek."""
+    """DEPRECATED 2026-09-08: scheduler tidak lagi cek versi per-jam.
+    Versi menyatu di siklus 5 jam via kv aa_remap/state.ver."""
     now = time.time()
     vst = _read_version_state()
     try:
@@ -723,8 +829,10 @@ def _maybe_auto_on_cycle():
         return 0
 
 def remap_scheduler_thread():
+    """Siklus 5 jam: auto-ON (gate auto_off) + remap combo+vision+audio (gate reorder).
+    Versi AA TIDAK dicek per-jam lagi — dibaca dari hasil fetch di dalam remap
+    (kv aa_remap/state.ver) supaya hemat kuota."""
     fails = 0
-    last_ver_check = 0
     while True:
         try:
             auto_on = _auto_off_enabled()
@@ -739,24 +847,7 @@ def remap_scheduler_thread():
                 continue
             if _due_schedule():
                 code = _run_remap(reason="schedule")
-                last_ver_check = 0
             else:
-                now = time.time()
-                if now - last_ver_check >= VERSION_CHECK_SEC:
-                    last_ver_check = now
-                    changed, live, base = _check_version_changed()
-                    if changed:
-                        log(f"[Version] {base} -> {live}: remap segera")
-                        code = _run_remap(force=True, reason=f"version:{base}->{live}")
-                        if code == 0:
-                            _save_cycle_state({**_cycle_state(), "lastVersionTrig": now})
-                        else:
-                            fails += 1
-                            if fails == 3:
-                                notify("Remap gagal 3x beruntun — backoff eksponensial aktif, cek coverage/E2E di /api/status.")
-                            time.sleep(min(300 * (2 ** min(fails - 1, 3)), 3600))
-                            continue
-                        last_ver_check = 0
                 fails = 0
                 time.sleep(SCHED_TICK_SEC)
                 continue
@@ -805,13 +896,16 @@ def _run_remap(force=False, reason="schedule"):
         log("[Remap] locked skip")
         return 5
     snapshot = None
+    settings_snap = None
     output = ""
     try:
         snapshot = _combo_snapshot()
-        log("[Remap] start discovery cycle")
+        settings_snap = _settings_snapshot()
+        log("[Remap] start discovery cycle (combo+vision+audio)")
         child_env = {**os.environ, "AA_REMAP_LOCK_HELD": "1"}
         result = subprocess.run(
-            ["/usr/bin/python3", "/home/ubuntu/scripts/9rkm/aa_rank.py", "--remap", "--no-vision"],
+            ["/usr/bin/python3", "/home/ubuntu/scripts/9rkm/aa_rank.py", "--remap",
+             "--with-vision", "--with-audio"],
             capture_output=True,
             text=True,
             timeout=1800,
@@ -829,8 +923,29 @@ def _run_remap(force=False, reason="schedule"):
         first = _combo_first_model()
         if not first or not _probe_model_direct(first):
             raise RuntimeError("first-model E2E failed")
+        # E2E adapter non-blokir: gagal = warning, combo tetap commit (anti rollback sia-sia).
+        try:
+            if not _probe_vision():
+                log("[Remap] WARN vision E2E failed (non-blocking)")
+        except Exception as e:
+            log(f"[Remap] WARN vision E2E error {e} (non-blocking)")
+        try:
+            if not _probe_audio():
+                log("[Remap] WARN audio E2E failed (non-blocking)")
+        except Exception as e:
+            log(f"[Remap] WARN audio E2E error {e} (non-blocking)")
         _save_cycle_state({"successCycle": cycle_id, "at": get_iso_now(), "status": "ok",
                            "reason": reason, "lastReasonAt": get_iso_now()})
+        try:
+            ver = _remap_ver()
+            if ver:
+                vst = _read_version_state()
+                vst.update({"ver": ver, "prevVer": vst.get("ver") or ver,
+                            "lastCheckAt": get_iso_now()})
+                vst.pop("lastCheckError", None)
+                _save_version_state(vst)
+        except Exception as e:
+            log(f"[Remap] version sync gagal {e}")
         log(f"[Remap] verified E2E ({reason})")
         return 0
     except Exception as error:
@@ -838,8 +953,10 @@ def _run_remap(force=False, reason="schedule"):
         if snapshot is not None:
             try:
                 _restore_combos(snapshot)
+                if settings_snap is not None:
+                    _restore_settings(settings_snap)
                 _restart_router()
-                log("[Remap] combo rollback restored")
+                log("[Remap] combo+settings rollback restored")
             except Exception as rollback_error:
                 log(f"[Remap] rollback failed {rollback_error}")
         _mark_remap_rolled_back(error)
